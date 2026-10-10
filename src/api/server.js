@@ -1,5 +1,5 @@
 const path = require('path');
-const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningReward, verifySignature, plotRegisterMessage, forkVoteMessage, evmTxHash, recoverTransactionSender, vrfProve, vrfVerify } = require('../crypto-utils/crypto');
+const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningReward, verifySignature, plotRegisterMessage, evmTxHash, recoverTransactionSender, vrfProve, vrfVerify } = require('../crypto-utils/crypto');
 const { log, getLogBuffer } = require('../../config/config');
 const MAX_PLOT_GB = require('../crypto-utils/plot-capacity').MAX_PLOT_GB;
 const { makeLocalAnnouncement, verifyAnnouncement } = require('../crypto-utils/plot-capacity');
@@ -110,71 +110,11 @@ class Server {
     } catch (e) { /* noop */ }
   }
 
-  _forkVoteTally(voteId) {
-    const rows = this.db.prepare('SELECT block_hash, stake FROM fork_votes WHERE vote_id = ?').all(voteId);
-    const totals = new Map();
-    for (const row of rows) {
-      totals.set(row.block_hash, (totals.get(row.block_hash) || 0n) + safeBigInt(row.stake, 0n));
-    }
-    return [...totals.entries()]
-      .map(([block_hash, stake]) => ({ block_hash, stake: String(stake), stake_cc: formatCcAmount(stake) }))
-      .sort((a, b) => {
-        const aStake = safeBigInt(a.stake, 0n);
-        const bStake = safeBigInt(b.stake, 0n);
-        if (aStake !== bStake) return aStake > bStake ? -1 : 1;
-        return a.block_hash < b.block_hash ? -1 : a.block_hash > b.block_hash ? 1 : 0;
-      });
-  }
-
-  _finishForkVote(voteId, result, resultHash, reorgApplied) {
-    const now = Math.floor(Date.now() / 1000);
-    this.db.transaction(() => {
-      if (!reorgApplied) {
-        const locks = this.db.prepare('SELECT voter, stake FROM fork_votes WHERE vote_id = ?').all(voteId);
-        for (const lock of locks) {
-          const user = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(lock.voter);
-          if (!user) continue;
-          const balance = safeBigInt(user.balance, 0n) + safeBigInt(lock.stake, 0n);
-          this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(balance), now, lock.voter);
-        }
-      }
-      this.db.prepare("UPDATE fork_vote_rounds SET status = 'finalized', finalized_at = ?, result_hash = ?, result = ? WHERE vote_id = ? AND status = 'finalizing'")
-        .run(now, resultHash || '', result, voteId);
-    })();
-  }
-
-  _isCanonicalHash(hash) {
-    let current = this.chain.getBlock(this.chain.height);
-    const seen = new Set();
-    while (current && current.hash && !seen.has(current.hash)) {
-      if (current.hash === hash) return true;
-      seen.add(current.hash);
-      current = current.parent_hash ? this.chain.getBlockByHash(current.parent_hash) : null;
-    }
-    return false;
-  }
-
-  _recoverFinalizingForkVotes() {
-    const rounds = this.db.prepare("SELECT vote_id, result, result_hash FROM fork_vote_rounds WHERE status = 'finalizing'").all();
-    for (const round of rounds) {
-      const reorgApplied = round.result === 'reorg_pending'
-        && !!round.result_hash
-        && this._isCanonicalHash(round.result_hash);
-      this._finishForkVote(
-        round.vote_id,
-        reorgApplied ? 'reorganized_recovered' : 'recovered_no_reorg',
-        reorgApplied ? round.result_hash : this.chain.bestHash,
-        reorgApplied,
-      );
-    }
-  }
-
   start() {
     const express = require('express');
     const helmet = require('helmet');
     const app = express();
     this.app = app;
-    this._recoverFinalizingForkVotes();
 
     const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -849,140 +789,6 @@ const validation = await this.chain.validateTxForMempool(tx);
       res.json(result);
     });
 
-    app.post('/api/node/vote/request', p2pLimiter, async (req, res) => {
-      const { vote_id, proposer, block_hash, block, voter, stake_cc, public_key, signature } = req.body || {};
-      const voteId = String(vote_id || '').trim();
-      const candidateHash = String(block_hash || '').toLowerCase();
-      const voterAddress = String(voter || '').toLowerCase();
-      if (!voteId || voteId.length > 128 || !proposer || !/^[0-9a-f]{64}$/.test(candidateHash) || !voterAddress || !public_key || !signature) {
-        return res.status(400).json({ error: 'vote_id, proposer, block_hash, voter, stake_cc, public_key, and signature required' });
-      }
-      const stake = parseCcAmount(stake_cc);
-      if (stake == null || stake <= 0n) return res.status(400).json({ error: 'stake_cc must be a positive decimal amount with up to 18 decimals' });
-      if (!/^0x[0-9a-f]{40}$/.test(voterAddress)) return res.status(400).json({ error: 'invalid voter address' });
-
-      const localTip = this.chain.getBlock(this.chain.height);
-      const candidate = block || this.chain.getBlockByHash(candidateHash);
-      if (!candidate) return res.status(404).json({ error: 'candidate block not found; include block in the request' });
-      if (String(candidate.hash || '').toLowerCase() !== candidateHash) {
-        return res.status(400).json({ error: 'block_hash does not match candidate block' });
-      }
-      if (!localTip || safeInt(candidate.height, -1) !== this.chain.height) {
-        return res.status(409).json({ error: 'vote is only valid for a competing block at the current tip height' });
-      }
-      if (safeInt(candidate.height, 0) > 0 && !this.chain.getBlockByHash(candidate.parent_hash)) {
-        return res.status(409).json({ error: 'candidate parent is not known by this node' });
-      }
-
-      try {
-        if (pubkeyToAddress(public_key).toLowerCase() !== voterAddress) {
-          return res.status(400).json({ error: 'voter address does not match public key' });
-        }
-        const user = this.db.prepare('SELECT address, balance, public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(voterAddress);
-        if (!user || !user.public_key_secp256k1) return res.status(403).json({ error: 'voter wallet is not registered with a public key' });
-        if (pubkeyToAddress(user.public_key_secp256k1).toLowerCase() !== voterAddress) {
-          return res.status(403).json({ error: 'registered voter key does not match voter address' });
-        }
-        const message = forkVoteMessage(voteId, candidateHash, voterAddress, stake.toString());
-        if (!verifySignature(message, signature, public_key)) return res.status(401).json({ error: 'invalid vote signature' });
-
-        let duplicate = false;
-        this.db.transaction(() => {
-          const round = this.db.prepare('SELECT height, status FROM fork_vote_rounds WHERE vote_id = ?').get(voteId);
-          if (round && round.status !== 'pending') {
-            const e = new Error('vote round is already finalized'); e.status = 409; throw e;
-          }
-          if (round && safeInt(round.height, -1) !== safeInt(candidate.height, -1)) {
-            const e = new Error('vote round height does not match candidate'); e.status = 409; throw e;
-          }
-          const existing = this.db.prepare('SELECT block_hash, stake FROM fork_votes WHERE vote_id = ? AND voter = ?').get(voteId, voterAddress);
-          if (existing) {
-            if (existing.block_hash !== candidateHash || String(existing.stake) !== stake.toString()) {
-              const e = new Error('voter has already voted differently in this round'); e.status = 409; throw e;
-            }
-            duplicate = true;
-            return;
-          }
-          const balance = safeBigInt((this.db.prepare('SELECT balance FROM users WHERE lower(address) = lower(?)').get(voterAddress) || {}).balance, -1n);
-          if (balance < stake) {
-            const e = new Error('insufficient available balance for vote stake'); e.status = 409; throw e;
-          }
-          const now = Math.floor(Date.now() / 1000);
-          this.db.prepare("INSERT OR IGNORE INTO fork_vote_rounds (vote_id, height, status, created_at) VALUES (?, ?, 'pending', ?)").run(voteId, candidate.height, now);
-          this.db.prepare('INSERT OR IGNORE INTO fork_vote_candidates (vote_id, block_hash, height, block_json, created_at) VALUES (?,?,?,?,?)')
-            .run(voteId, candidateHash, candidate.height, JSON.stringify(candidate), now);
-          this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE lower(address) = lower(?)')
-            .run(String(balance - stake), now, voterAddress);
-          this.db.prepare('INSERT INTO fork_votes (vote_id, block_hash, voter, stake, public_key, signature, created_at) VALUES (?,?,?,?,?,?,?)')
-            .run(voteId, candidateHash, voterAddress, stake.toString(), public_key, signature, now);
-        })();
-
-        const tally = this._forkVoteTally(voteId);
-        const payload = {
-          vote_id: voteId, proposer, block_hash: candidateHash, block: candidate,
-          voter: voterAddress, stake_cc: String(stake_cc), public_key, signature, _relayed: true,
-        };
-        if (!(req.body || {})._relayed && this.sync && typeof this.sync.broadcastForkVote === 'function') {
-          setImmediate(() => this.sync.broadcastForkVote(payload).catch(() => {}));
-        }
-        return res.json({ ok: true, duplicate, vote_id: voteId, voter: voterAddress, block_hash: candidateHash, stake: stake.toString(), stake_cc: formatCcAmount(stake), tally });
-      } catch (e) {
-        return res.status(e.status || 400).json({ error: e.message || 'vote rejected' });
-      }
-    });
-
-    app.post('/api/node/vote/finalize', p2pLimiter, async (req, res) => {
-      const voteId = String((req.body || {}).vote_id || '').trim();
-      if (!voteId) return res.status(400).json({ error: 'vote_id required' });
-      const round = this.db.prepare('SELECT * FROM fork_vote_rounds WHERE vote_id = ?').get(voteId);
-      if (!round) return res.status(404).json({ error: 'vote round not found' });
-      if (round.status === 'finalized') {
-        return res.json({ ok: true, vote_id: voteId, result: round.result, hash: round.result_hash, finalized: true });
-      }
-      const tally = this._forkVoteTally(voteId);
-      if (!tally.length) return res.status(409).json({ error: 'cannot finalize a round with no votes' });
-      const claimed = this.db.prepare("UPDATE fork_vote_rounds SET status = 'finalizing' WHERE vote_id = ? AND status = 'pending'").run(voteId);
-      if (claimed.changes !== 1) return res.status(409).json({ error: 'vote round is already being finalized' });
-
-      let result = 'tie_no_reorg';
-      let resultHash = this.chain.bestHash;
-      let reorgApplied = false;
-      try {
-        const winner = tally[0];
-        const tied = tally.length > 1 && tally[0].stake === tally[1].stake;
-        const localTip = this.chain.getBlock(this.chain.height);
-        const reorgExpected = !tied
-          && safeInt(round.height, -1) === this.chain.height
-          && localTip
-          && winner.block_hash !== String(localTip.hash).toLowerCase();
-        this.db.prepare("UPDATE fork_vote_rounds SET result = ?, result_hash = ? WHERE vote_id = ? AND status = 'finalizing'")
-          .run(reorgExpected ? 'reorg_pending' : 'refund_pending', reorgExpected ? winner.block_hash : '', voteId);
-        if (safeInt(round.height, -1) !== this.chain.height) {
-          result = 'stale_no_reorg';
-        } else if (!tied && localTip && winner.block_hash !== String(localTip.hash).toLowerCase()) {
-          const candidateRow = this.db.prepare('SELECT block_json FROM fork_vote_candidates WHERE vote_id = ? AND block_hash = ?').get(voteId, winner.block_hash);
-          if (!candidateRow) throw new Error('winning candidate block is not available');
-          let candidate;
-          try { candidate = JSON.parse(candidateRow.block_json); } catch { throw new Error('winning candidate block is corrupted'); }
-          const reorg = await this.chain.reorganize(candidate, false, true);
-          if (!reorg.ok) throw new Error(reorg.motivo || 'vote-selected reorg failed');
-          reorgApplied = true;
-          result = 'reorganized';
-          resultHash = reorg.hash || this.chain.bestHash;
-        } else if (!tied) {
-          result = 'already_on_winner';
-        }
-        this._finishForkVote(voteId, result, resultHash, reorgApplied);
-        if (!(req.body || {})._relayed && this.sync && typeof this.sync.broadcastForkVoteFinalize === 'function') {
-          setImmediate(() => this.sync.broadcastForkVoteFinalize({ vote_id: voteId, _relayed: true }).catch(() => {}));
-        }
-        return res.json({ ok: true, vote_id: voteId, result, winner: tied ? null : winner.block_hash, tally, hash: resultHash, finalized: true });
-      } catch (e) {
-        this._finishForkVote(voteId, 'failed_no_reorg', this.chain.bestHash, false);
-        return res.status(409).json({ ok: false, vote_id: voteId, error: e.message || 'vote finalization failed', tally });
-      }
-    });
-
     app.post('/api/node/forge', requireAdmin, async (req, res) => {
       const challenge = this.challengeMgr.getOrCreate();
       if (!challenge) return res.status(400).json({ error: 'no challenge' });
@@ -1074,6 +880,7 @@ const validation = await this.chain.validateTxForMempool(tx);
   stop() {
     if (this._peerStorageTimer) { clearInterval(this._peerStorageTimer); this._peerStorageTimer = null; }
     if (this.server) try { this.server.close(); } catch {}
+    try { require('../utils/worker-pool').terminateWorkerPool(); } catch {}
   }
 }
 

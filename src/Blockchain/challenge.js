@@ -64,8 +64,8 @@ class ChallengeManager {
     const maxDl = chain.computeMaxDeadline();
     deadline = safeInt(deadline, -1);
     if (deadline < 0 || deadline > maxDl) return { ok: false, motivo: `invalid deadline (must be 0–${maxDl}s)` };
-    const plot = this.db.prepare('SELECT * FROM plot_commitments WHERE plot_id = ? AND miner = ?').get(plotId, miner);
-    const peerPlot = this.db.prepare('SELECT * FROM peer_plot_commitments WHERE plot_id = ? AND miner = ?').get(plotId, miner);
+    const plot = this.db.prepare('SELECT * FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plotId, miner);
+    const peerPlot = this.db.prepare('SELECT * FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plotId, miner);
     const commitment = plot || peerPlot;
     const sizeGb = commitment ? (Number(commitment.size_gb) || 1) : 1;
     const committedRoot = (commitment && commitment.merkle_root) || '';
@@ -74,25 +74,29 @@ class ChallengeManager {
     const genSig = ch.challenge_seed || ZERO_HASH;
     const networkBaseTarget = ch.base_target || chain._baseTargetForHeight(ch.block_height || chain.height);
     const computedDeadline = Math.min(computeDeadline(proofPacket.scoop_data, genSig, networkBaseTarget), maxDl);
-    if (Math.abs(computedDeadline - deadline) > 1) return { ok: false, motivo: `PoC verification failed: computed ${computedDeadline}s, submitted ${deadline}s` };
-    const expectedDigest = sha256hex(Buffer.concat([Buffer.from(proofPacket.scoop_data, 'hex'), Buffer.from(String(deadline))]));
+    if (computedDeadline !== deadline) return { ok: false, motivo: `PoC verification failed: computed ${computedDeadline}s, submitted ${deadline}s` };
+    const expectedDigest = sha256hex(Buffer.concat([Buffer.from(proofPacket.scoop_data, 'hex'), Buffer.from(String(computedDeadline))]));
     if (proofPacket.proof_digest && proofPacket.proof_digest !== expectedDigest) return { ok: false, motivo: 'proof digest mismatch' };
     const totalScoops = safeInt(proofPacket.total_scoops, 0) || plotScoopCount(sizeGb);
     const scoopIndex = safeInt(proofPacket.scoop_index, -1);
     if (scoopIndex < 0 || scoopIndex >= totalScoops) return { ok: false, motivo: `invalid scoop_index ${scoopIndex} for ${totalScoops} scoops` };
+    const expectedTargetIdx = ch.target_scoop_index != null
+      ? safeInt(ch.target_scoop_index, -1)
+      : parseInt(sha256hex(genSig).slice(0, 8), 16) % MINING_SCOOP_MODULUS;
+    if (scoopIndex % MINING_SCOOP_MODULUS !== expectedTargetIdx) {
+      return { ok: false, motivo: `scoop_index ${scoopIndex} is not the challenge target scoop (expected mod ${MINING_SCOOP_MODULUS} == ${expectedTargetIdx})` };
+    }
     const merkleProof = proofPacket.merkle_proof || [];
     const leafHash = Buffer.from(proofPacket.scoop_data, 'hex');
     if (!verifyMerkleProofBuf(leafHash, scoopIndex, totalScoops, merkleProof, committedRoot)) return { ok: false, motivo: 'Merkle proof does not match committed plot root' };
 
     const proofSig = (proofPacket && proofPacket.proof_signature) || '';
-    if (proofSig) {
-      const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(miner);
-      if (pkRow && pkRow.public_key_secp256k1) {
-        const msg = proofMessage(challengeId, miner, deadline, plotId);
-        if (!verifySignature(msg, proofSig, pkRow.public_key_secp256k1)) {
-          return { ok: false, motivo: 'proof signature does not match miner address' };
-        }
-      }
+    if (!proofSig) return { ok: false, motivo: 'proof_signature required' };
+    const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(miner);
+    if (!pkRow || !pkRow.public_key_secp256k1) return { ok: false, motivo: 'miner has no registered public key' };
+    const msg = proofMessage(challengeId, miner, deadline, plotId);
+    if (!verifySignature(msg, proofSig, pkRow.public_key_secp256k1)) {
+      return { ok: false, motivo: 'proof signature does not match miner address' };
     }
 
     const insertRes = this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at) VALUES (?,?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, proofSig, now);

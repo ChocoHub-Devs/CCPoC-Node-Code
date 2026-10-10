@@ -260,9 +260,24 @@ class Chain {
       try { blockTarget = BigInt(bloco.target || '0'); } catch { blockTarget = 0n; }
       if (blockTarget === 0n) try { blockTarget = BigInt(this.cfg.initialTarget); } catch { blockTarget = 0n; }
       if (blockTarget !== expectedTarget) return { ok: false, motivo: `incorrect target: got ${blockTarget}, expected ${expectedTarget}` };
+      const blockWork = (2n ** 64n) / blockTarget;
+      const expected_chain_work = blockWork;
+      let actualChainWork;
+      try {
+        actualChainWork = BigInt(bloco.chain_work || '0');
+      } catch {
+        return { ok: false, motivo: 'invalid chain_work format' };
+      }
+      if (actualChainWork !== expected_chain_work) {
+        return { 
+          ok: false, 
+          motivo: `Fake block detected, chain_work is inflated. expected: ${expected_chain_work.toString()}, got ${bloco.chain_work}` 
+        };
+      }
       const expectedBaseTarget = BigInt(this._baseTargetForHeight(height));
       if (!bloco.base_target) bloco.base_target = String(expectedBaseTarget);
-      const blockBaseTarget = BigInt(bloco.base_target);
+      let blockBaseTarget;
+      try { blockBaseTarget = BigInt(bloco.base_target); } catch { return { ok: false, motivo: 'invalid base_target format' }; }
       if (expectedBaseTarget > 0n && blockBaseTarget > 0n) {
         const ratio = blockBaseTarget > expectedBaseTarget
           ? blockBaseTarget / expectedBaseTarget
@@ -278,7 +293,8 @@ class Chain {
     const [balanceOk, balanceMotivo] = this._validateTxBalances(txs);
     if (!balanceOk) return { ok: false, motivo: balanceMotivo };
     {
-      const blockBaseFee = BigInt(this._baseFeeForHeight(height));
+      let blockBaseFee;
+      try { blockBaseFee = BigInt(this._baseFeeForHeight(height)); } catch { return { ok: false, motivo: 'invalid base_fee' }; }
       for (const tx of txs) {
         const intrinsic = estimateIntrinsicGas(tx);
         const gasLimit = safeInt(tx.gas_limit, 0);
@@ -298,13 +314,14 @@ class Chain {
         try { pubkeyToAddress(bloco.miner_public_key); } catch { return { ok: false, motivo: 'invalid miner_public_key encoding' }; }
         signerPubKey = bloco.miner_public_key;
       }
+      const expectedSigner = String(bloco.forger || bloco.miner || '').toLowerCase();
       if (!signerPubKey) {
-        const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE address = ?').get(bloco.miner);
+        const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE address = ?').get(expectedSigner);
         if (pkRow && pkRow.public_key_secp256k1) signerPubKey = pkRow.public_key_secp256k1;
       }
-      if (!signerPubKey) return { ok: false, motivo: 'miner not registered or no key' };
+      if (!signerPubKey) return { ok: false, motivo: 'forger not registered or no key' };
       try {
-        if (pubkeyToAddress(signerPubKey).toLowerCase() !== String(bloco.miner).toLowerCase()) return { ok: false, motivo: 'block signer does not match miner' };
+        if (pubkeyToAddress(signerPubKey).toLowerCase() !== expectedSigner) return { ok: false, motivo: 'block signer does not match forger' };
       } catch { return { ok: false, motivo: 'invalid block signer key' }; }
       if (!verifySignature(blockMessage(bloco), bloco.signature, signerPubKey)) return { ok: false, motivo: 'invalid block signature' };
 
@@ -377,6 +394,12 @@ class Chain {
         if (knownPlot.merkle_root.toLowerCase() !== merkleRootClaim.toLowerCase()) {
           return { ok: false, motivo: 'winner_proof merkle_root does not match committed plot root' };
         }
+        const expectedTargetIdx = challenge.target_scoop_index != null
+          ? safeInt(challenge.target_scoop_index, -1)
+          : parseInt(sha256hex(String(challenge.challenge_seed || '')).slice(0, 8), 16) % MINING_SCOOP_MODULUS;
+        if (scoopIndex % MINING_SCOOP_MODULUS !== expectedTargetIdx) {
+          return { ok: false, motivo: `winner_proof scoop_index ${scoopIndex} is not the challenge target scoop (expected mod ${MINING_SCOOP_MODULUS} == ${expectedTargetIdx})` };
+        }
         const leafHash = Buffer.from(scoopData, 'hex');
         if (!verifyMerkleProofBuf(leafHash, scoopIndex, totalScoops, merkleProof, merkleRootClaim)) {
           return { ok: false, motivo: 'winner_proof merkle proof does not match committed plot root' };
@@ -387,20 +410,22 @@ class Chain {
         }
         if (genSig !== String(challenge.challenge_seed || '')) return { ok: false, motivo: 'winner_proof challenge_seed mismatch' };
         if (safeInt(challenge.block_height, -1) !== height - 1) return { ok: false, motivo: 'challenge does not belong to parent height' };
+        const challengeBt = String(challenge.base_target || this._baseTargetForHeight(challenge.block_height || height - 1));
         const wpBaseTarget = safeBigInt(wp.base_target, 0n);
-        if (wpBaseTarget <= 0n) {
-          return { ok: false, motivo: 'winner_proof missing base_target' };
-        }
-        const expectedChallengeBt = BigInt(this._baseTargetForHeight(height - 1));
-        if (expectedChallengeBt > 0n) {
-          const ratio = wpBaseTarget > expectedChallengeBt ? wpBaseTarget / expectedChallengeBt : expectedChallengeBt / wpBaseTarget;
-          const maxRatio = BigInt(Math.max(1, safeInt(this.cfg.btDriftTolerance, 2)));
-          if (ratio > maxRatio) {
-            return { ok: false, motivo: `winner_proof base_target drift (${Number(ratio)}x > ${maxRatio}x)` };
+        if (wpBaseTarget > 0n && /^\d+$/.test(challengeBt)) {
+          const expectedChallengeBt = BigInt(challengeBt);
+          if (expectedChallengeBt > 0n) {
+            const ratio = wpBaseTarget > expectedChallengeBt ? wpBaseTarget / expectedChallengeBt : expectedChallengeBt / wpBaseTarget;
+            const maxRatio = BigInt(Math.max(1, safeInt(this.cfg.btDriftTolerance, 2)));
+            if (ratio > maxRatio) {
+              return { ok: false, motivo: `winner_proof base_target drift (${Number(ratio)}x > ${maxRatio}x)` };
+            }
           }
         }
-        const recomputed = computeDeadline(scoopData, genSig, String(wpBaseTarget));
-        if (Math.abs(recomputed - wpDeadline) > 1) {
+        // Always recompute the deadline against the authoritative challenge base target,
+        // never the miner-supplied one (a 2x larger bt halves the deadline).
+        const recomputed = computeDeadline(scoopData, genSig, /^\d+$/.test(challengeBt) && BigInt(challengeBt) > 0n ? challengeBt : String(wpBaseTarget));
+        if (recomputed !== wpDeadline) {
           return { ok: false, motivo: `PoC verification failed: computed deadline ${recomputed}s, claimed ${wpDeadline}s` };
         }
       }
@@ -438,6 +463,7 @@ class Chain {
         if (doomed && doomed.miner && doomed.miner !== 'genesis') this._rollbackRewardsForBlocks(doomed.miner, doomed.reward_cc);
         if (doomed) this._rollbackPayoutsForBlock(doomed.hash);
         this.db.prepare('DELETE FROM contract_logs WHERE block_hash = ?').run(existingAtHeight.hash);
+        this.db.prepare('DELETE FROM transactions WHERE block_hash = ?').run(existingAtHeight.hash);
         this.db.prepare('DELETE FROM blocks WHERE hash = ?').run(existingAtHeight.hash);
         log('debug', `addBlock forceSync: replaced incumbent ${existingAtHeight.hash.slice(0, 10)} at h=${height}`);
       } else if (isBetterChainCandidate(bloco, this.getBlockByHash(existingAtHeight.hash))
@@ -913,21 +939,6 @@ class Chain {
         if (cur && safeInt(cur.nonce, 0) < nonces[addr]) this.db.prepare('UPDATE users SET nonce = ?, updated_at = ? WHERE address = ?').run(nonces[addr], now, addr);
       }
     }
-    try {
-      const locked = new Map();
-      const rows = this.db.prepare(`SELECT v.voter, v.stake FROM fork_votes v
-        JOIN fork_vote_rounds r ON r.vote_id = v.vote_id
-        WHERE r.status = 'pending'`).all();
-      for (const row of rows) {
-        locked.set(row.voter, (locked.get(row.voter) || 0n) + safeBigInt(row.stake, 0n));
-      }
-      for (const [address, amount] of locked) {
-        const user = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(address);
-        if (user) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(safeBigInt(user.balance, 0n) - amount), now, address);
-      }
-    } catch (e) {
-      log('warn', `Fork vote lock reconciliation: ${e.message}`);
-    }
   }
 
   async _insertBlockDirect(blk) {
@@ -1027,7 +1038,7 @@ class Chain {
 
   retireOldBlocks() {
     if (this.cfg.pruningEnabled === false) return 0;
-    const window = safeInt(this.cfg.anchorWindowSize, ANCHOR_WINDOW_SIZE);
+    const window = safeInt(this.cfg.anchorWindowSize, Config.Configuration.ANCHOR_WINDOW_SIZE);
     const tip = this.db.prepare('SELECT MAX(height) AS m FROM blocks').get().m || 0;
     const cutoff = tip - window;
     if (cutoff < 0) return 0;
@@ -1079,10 +1090,12 @@ class Diff_Manager {
     const latest = this.db.prepare('SELECT timestamp FROM blocks WHERE height = ?').get(height - 1);
     if (prevInterval && latest) {
       const actual = latest.timestamp - prevInterval.timestamp;
+      // actual is the timespan of (interval) blocks, not a single block
+      const expectedSpan = expected * interval;
       const target = BigInt(this._targetForHeight(height - 1));
-      if (actual < expected / 2) return target * 2n;
-      if (actual > expected * 2) return target / 2n;
-      const ratio = BigInt(Math.floor((expected * 1000) / Math.max(1, actual)));
+      if (actual < expectedSpan / 2) return target * 2n;
+      if (actual > expectedSpan * 2) return target / 2n;
+      const ratio = BigInt(Math.floor((expectedSpan * 1000) / Math.max(1, actual)));
       return (target * ratio) / 1000n;
     }
     try { return BigInt(this.cfg.initialTarget); } catch { return 0n; }
@@ -1090,9 +1103,9 @@ class Diff_Manager {
 
   _blockWork(block) {
     try {
-      const target = BigInt(block.target || this.cfg.initialTarget || '0x00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
-      if (target <= 0n) return 1n;
-      return (BigInt(2) ** BigInt(256)) / target;
+      const baseTarget = BigInt(block.base_target ||  this.cfg.initialTarget);
+      if (baseTarget <= 0n) return 1n;
+      return (2n ** 64n / baseTarget);
     } catch { return 1n; }
   }
 
@@ -1209,7 +1222,7 @@ class MemPool_Manager {
           : (String(tx.hash).startsWith('0x') ? evmTxHash(tx) : hashTransaction(tx));
         if (String(tx.hash).toLowerCase() !== String(expectedHash).toLowerCase() && String(tx.hash).toLowerCase() !== hashTransaction(tx).toLowerCase() && String(tx.hash).toLowerCase() !== evmTxHash(tx).toLowerCase()) return [false, 'transaction hash mismatch'];
       }
-      if (!projectedNonce[sender]) {
+      if (!(sender in projectedNonce)) {
         const user = this.db.prepare('SELECT nonce, balance FROM users WHERE address = ?').get(sender);
         projectedNonce[sender] = user ? safeInt(user.nonce, 0) : 0;
         projectedBalance[sender] = user ? safeBigInt(user.balance, 0n) : 0n;
@@ -1236,7 +1249,7 @@ class MemPool_Manager {
       const sender = tx.from_addr;
       if (!sender) return [false, 'invalid tx sender'];
       if (safeInt(tx.value, -1) < 0 || safeInt(tx.fee, -1) < 0) return [false, `invalid tx values for ${sender}`];
-      if (!projectedBalance[sender]) {
+      if (!(sender in projectedBalance)) {
         const user = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(sender);
         projectedBalance[sender] = user ? safeBigInt(user.balance, 0n) : 0n;
       }

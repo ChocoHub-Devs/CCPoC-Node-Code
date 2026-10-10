@@ -115,36 +115,6 @@ function initDB(dbPath, cfg) {
       key TEXT PRIMARY KEY, value TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS fork_vote_rounds (
-      vote_id TEXT PRIMARY KEY,
-      height INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL,
-      finalized_at INTEGER,
-      result_hash TEXT DEFAULT '',
-      result TEXT DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS fork_vote_candidates (
-      vote_id TEXT NOT NULL,
-      block_hash TEXT NOT NULL,
-      height INTEGER NOT NULL,
-      block_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      PRIMARY KEY (vote_id, block_hash)
-    );
-    CREATE TABLE IF NOT EXISTS fork_votes (
-      vote_id TEXT NOT NULL,
-      block_hash TEXT NOT NULL,
-      voter TEXT NOT NULL,
-      stake TEXT NOT NULL,
-      public_key TEXT NOT NULL,
-      signature TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      PRIMARY KEY (vote_id, voter)
-    );
-    CREATE INDEX IF NOT EXISTS idx_fork_votes_round ON fork_votes(vote_id);
-    CREATE INDEX IF NOT EXISTS idx_fork_votes_candidate ON fork_votes(vote_id, block_hash);
-
     CREATE TABLE IF NOT EXISTS smart_contracts (
       address TEXT PRIMARY KEY,
       creator TEXT,

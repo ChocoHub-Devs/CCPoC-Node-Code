@@ -449,15 +449,6 @@ class SyncEngine {
     })));
   }
 
-  async broadcastForkVote(vote) {
-    const key = `fork-vote:${vote && vote.vote_id}:${vote && vote.voter}`;
-    if (!this._rememberBroadcast(key)) return { deduped: true };
-    const peers = this.peers.active(10);
-    await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/vote/request`, {
-      method: 'POST', body: { ...vote, _relayed: true }, timeout: 8,
-    })));
-  }
-
   async broadcastForkVoteFinalize(request) {
     const key = `fork-vote-finalize:${request && request.vote_id}`;
     if (!this._rememberBroadcast(key)) return { deduped: true };

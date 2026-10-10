@@ -97,14 +97,16 @@ class ChocoNode {
       this.server.p2pWsServer = this.p2pWsServer;
     }
 
-    setInterval(() => { try { this.peers.decayHealth(); } catch {} }, 300000);
-    setInterval(() => { try { this.chain.cleanMempool(); } catch {} }, 60000);
-    setInterval(() => { try { this.chain.retireOldBlocks(); } catch {} }, 600000);
-    setInterval(() => { try { if (!this.db || this.db.open === false) return; this.challengeMgr.finalizeExpiredChallenges(this.chain, this.sync).catch(e => log('error', `Finalize error: ${e.message}`)); } catch {} }, 5000);
-    setInterval(() => { this.sync.loopSync().catch(() => {}); }, cfg.syncIntervalMs || 10000);
-    setInterval(() => { this.sync.heartbeat().catch(() => {}); }, cfg.heartbeatMs || 20000);
-    setInterval(() => { this.sync.plotsGossip().catch(() => {}); }, Math.max(30000, (cfg.heartbeatMs || 20000) * 3));
-    setInterval(() => { this.sync.discoverPeers().catch(() => {}); }, cfg.discoveryMs || 30000);
+    this._intervals = [
+      setInterval(() => { try { this.peers.decayHealth(); } catch {} }, 300000),
+      setInterval(() => { try { this.chain.cleanMempool(); } catch {} }, 60000),
+      setInterval(() => { try { this.chain.retireOldBlocks(); } catch {} }, 600000),
+      setInterval(() => { try { if (!this.db || this.db.open === false) return; this.challengeMgr.finalizeExpiredChallenges(this.chain, this.sync).catch(e => log('error', `Finalize error: ${e.message}`)); } catch {} }, 5000),
+      setInterval(() => { this.sync.loopSync().catch(() => {}); }, cfg.syncIntervalMs || 10000),
+      setInterval(() => { this.sync.heartbeat().catch(() => {}); }, cfg.heartbeatMs || 20000),
+      setInterval(() => { this.sync.plotsGossip().catch(() => {}); }, Math.max(30000, (cfg.heartbeatMs || 20000) * 3)),
+      setInterval(() => { this.sync.discoverPeers().catch(() => {}); }, cfg.discoveryMs || 30000),
+    ];
 
     setTimeout(async () => {
       log('info', 'Initial sync...');
@@ -140,9 +142,13 @@ class ChocoNode {
     const shutdown = () => {
       if (this._stopDiscovery) this._stopDiscovery();
       log('info', 'Shutting down...');
-      try { this.db.close(); } catch {}
+      if (this.p2pWsServer) this.p2pWsServer.stop();
       if (this.server) this.server.stop();
-      setTimeout(() => process.exit(0), 5000);
+      if (this._intervals) this._intervals.forEach(t => clearInterval(t));
+      setTimeout(() => {
+        try { this.db.close(); } catch {}
+        setTimeout(() => process.exit(0), 1000);
+      }, 1000);
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);

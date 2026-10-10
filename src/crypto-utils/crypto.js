@@ -493,16 +493,6 @@ function plotRegisterMessage(miner, plotId, merkleRoot, sizeGb, totalScoops) {
   }, ['merkle_root', 'miner', 'plot_id', 'size_gb', 'total_scoops', 'type'].sort());
 }
 
-function forkVoteMessage(voteId, blockHash, voter, stake) {
-  return JSON.stringify({
-    type: 'fork_vote',
-    vote_id: String(voteId),
-    block_hash: String(blockHash).toLowerCase(),
-    voter: String(voter).toLowerCase(),
-    stake: String(stake),
-  }, ['block_hash', 'stake', 'type', 'vote_id', 'voter'].sort());
-}
-
 const VRF_H2C_DOMAIN = Buffer.from('CC-VRF-h2c-v2');
 const VRF_SECRET_DOMAIN = Buffer.from('CC-VRF-secret-v1');
 const VRF_C_DOMAIN = Buffer.from('CC-VRF-c-v1');
@@ -779,7 +769,7 @@ module.exports = {
   pubkeyToAddress, pubKeyToAddress, signMessage, verifySignature,
   evmTxDigest, evmTxHash, signTransactionTx, recoverTransactionSender, signatureToHex, signatureFromHex,
   merkleRoot, merkleRootBuffer, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf,
-  canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage, plotRegisterMessage, forkVoteMessage,
+  canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage, plotRegisterMessage,
   computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, calculateMiningReward, isBetterChainCandidate,
   SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, PLOT_FORMAT_V3, merkleTreeInternalNodeCount, plotScoopCount, plotScoopCountOrig,
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
