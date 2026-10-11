@@ -260,20 +260,6 @@ class Chain {
       try { blockTarget = BigInt(bloco.target || '0'); } catch { blockTarget = 0n; }
       if (blockTarget === 0n) try { blockTarget = BigInt(this.cfg.initialTarget); } catch { blockTarget = 0n; }
       if (blockTarget !== expectedTarget) return { ok: false, motivo: `incorrect target: got ${blockTarget}, expected ${expectedTarget}` };
-      const blockWork = (2n ** 64n) / blockTarget;
-      const expected_chain_work = blockWork;
-      let actualChainWork;
-      try {
-        actualChainWork = BigInt(bloco.chain_work || '0');
-      } catch {
-        return { ok: false, motivo: 'invalid chain_work format' };
-      }
-      if (actualChainWork !== expected_chain_work) {
-        return { 
-          ok: false, 
-          motivo: `Fake block detected, chain_work is inflated. expected: ${expected_chain_work.toString()}, got ${bloco.chain_work}` 
-        };
-      }
       const expectedBaseTarget = BigInt(this._baseTargetForHeight(height));
       if (!bloco.base_target) bloco.base_target = String(expectedBaseTarget);
       let blockBaseTarget;
