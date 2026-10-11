@@ -49,12 +49,6 @@ function initDB(dbPath, cfg) {
       created_at INTEGER, updated_at INTEGER
     );
 
-    -- Metadados de registo (public key por endereço). ESTA TABELA NAO FAZ PARTE
-    -- DO STATE_ROOT: o estado de consenso e apenas users(balance, nonce).
-    -- Antes as APIs de registo de wallet/plot criavam linhas em users com
-    -- balance=0, o que alterava o state_root de cada node conforme as chamadas
-    -- de API que fez localmente — e a rede rejeitava os blocos com
-    -- "state_root mismatch" ao sincronizar.
     CREATE TABLE IF NOT EXISTS user_keys (
       address TEXT PRIMARY KEY, public_key_secp256k1 TEXT UNIQUE,
       created_at INTEGER, updated_at INTEGER
@@ -211,9 +205,6 @@ function initDB(dbPath, cfg) {
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_output TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_proof TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_verified INTEGER DEFAULT 0').run(); } catch {}
-  // Chave pública e assinatura ORIGINAIS do miner. Sem elas o node re-criava a
-  // assinatura com a sua própria chave ao gossipar plots de terceiros, e os
-  // peers rejeitavam com "address does not match public key".
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN signature TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN merkle_root TEXT DEFAULT ""').run(); } catch {}
@@ -222,8 +213,6 @@ function initDB(dbPath, cfg) {
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_proof TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN signature TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch {};
-  // total_scoops faz parte da mensagem assinada; sem o valor exato o relay
-  // multi-hop não consegue re-servir o anúncio sem invalidar a assinatura.
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN total_scoops INTEGER DEFAULT 0').run(); } catch {}
   try { db.prepare("ALTER TABLE transactions ADD COLUMN chain_id TEXT DEFAULT ''").run(); } catch {}
 
@@ -255,15 +244,10 @@ function initDB(dbPath, cfg) {
     db.prepare('INSERT OR IGNORE INTO users (address, public_key_secp256k1, balance, nonce, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(treasuryAddress, '', '0', 0, cfg.genesisTimestamp || Math.floor(Date.now() / 1000), cfg.genesisTimestamp || Math.floor(Date.now() / 1000));
   }
 
-  // Migracao: as public keys passam de users para user_keys, para que os registos
-  // de wallet/plot deixem de escrever em users (estado de consenso). Sem isto,
-  // cada node tinha um state_root diferente consoante as chamadas de API que fez.
   try {
     const keyed = db.prepare("SELECT address, public_key_secp256k1, created_at, updated_at FROM users WHERE public_key_secp256k1 IS NOT NULL AND public_key_secp256k1 != ''").all();
     const insKey = db.prepare('INSERT OR IGNORE INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?,?,?,?)');
     for (const k of keyed) insKey.run(String(k.address).toLowerCase(), k.public_key_secp256k1, k.created_at || 0, k.updated_at || 0);
-    // Limpar contas fantasma: balance 0 e nonce 0 e sem saldo = nunca foram
-    // criadas pela consenso (nem genesis/tesouro, que fica preservado).
     const phantom = db.prepare("SELECT address FROM users WHERE balance = '0' AND (nonce IS NULL OR nonce = 0) AND address != ?").all(treasuryAddress);
     const delUser = db.prepare('DELETE FROM users WHERE address = ?');
     for (const p of phantom) delUser.run(p.address);

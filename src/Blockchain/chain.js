@@ -147,34 +147,47 @@ class Chain {
         subKeys = new Set(subs.map(s => `${normalizeAddr(s.miner)}:${s.plot_id || ''}:${s.deadline}`));
       }
     }
-    if (rewardsData.length !== 1) return { ok: false, motivo: `winner-takes-all expects exactly one reward entry (got ${rewardsData.length})` };
-    const r = rewardsData[0];
-    if (typeof r !== 'object' || r === null || !r.miner) return { ok: false, motivo: 'reward entry missing miner' };
-    const miner = normalizeAddr(r.miner);
-    if (miner !== normalizeAddr(bloco.miner || '')) return { ok: false, motivo: 'reward miner does not match block miner' };
-    const plot = r.plot_id || '';
-    const deadline = safeInt(r.deadline, -1);
-    if (deadline < 0) return { ok: false, motivo: 'reward entry has invalid deadline' };
+    if (rewardsData.length < 1 || rewardsData.length > MAX_REWARD_ENTRIES) return { ok: false, motivo: `reward entries must be between 1 and ${MAX_REWARD_ENTRIES} (got ${rewardsData.length})` };
     const wp = bloco.winner_proof && typeof bloco.winner_proof === 'object' ? bloco.winner_proof : null;
-    if (wp) {
-      // A recompensa tem de corresponder à prova vencedora QUE O BLOCO TRAZ
-      // (assinatura, scoop, merkle e deadline já verificados acima) — não às
-      // submissões que este node observou: o mesmo miner pode submeter plots
-      // diferentes a nodes diferentes, e cada node só vê parte das provas.
-      if (normalizeAddr(wp.miner || '') !== miner) return { ok: false, motivo: 'reward miner does not match winner_proof miner' };
-      if (String(wp.plot_id || '') !== plot) return { ok: false, motivo: 'reward plot does not match winner_proof plot' };
-      if (safeInt(wp.deadline, -1) !== deadline) return { ok: false, motivo: 'reward deadline does not match winner_proof deadline' };
-    } else {
+    if (!wp) {
+      if (rewardsData.length !== 1) return { ok: false, motivo: `winner-takes-all expects exactly one reward entry (got ${rewardsData.length})` };
+      const r = rewardsData[0];
+      if (typeof r !== 'object' || r === null || !r.miner) return { ok: false, motivo: 'reward entry missing miner' };
+      const miner = normalizeAddr(r.miner);
+      if (miner !== normalizeAddr(bloco.miner || '')) return { ok: false, motivo: 'reward miner does not match block miner' };
+      const plot = r.plot_id || '';
+      const deadline = safeInt(r.deadline, -1);
+      if (deadline < 0) return { ok: false, motivo: 'reward entry has invalid deadline' };
       const key = `${miner}:${plot}:${deadline}`;
       if (subKeys && !subKeys.has(key)) {
         log('warn', `reward entry for ${miner} has no matching submission in challenge ${(bloco.challenge_id || '').slice(0, 12)}`);
         return { ok: false, motivo: `reward for ${miner} has no matching proof submission` };
       }
+      let reward;
+      try { reward = BigInt(r.reward_cc || '0'); } catch { reward = 0n; }
+      if (reward < 0n) return { ok: false, motivo: 'reward entry has negative reward_cc' };
+      if (reward !== totalReward) return { ok: false, motivo: 'reward entry must equal the block reward' };
+      return { ok: true };
     }
-    let reward;
-    try { reward = BigInt(r.reward_cc || '0'); } catch { reward = 0n; }
-    if (reward < 0n) return { ok: false, motivo: 'reward entry has negative reward_cc' };
-    if (reward !== totalReward) return { ok: false, motivo: 'reward entry must equal the block reward' };
+    const wpMiner = normalizeAddr(wp.miner || '');
+    const wpPlot = String(wp.plot_id || '');
+    const wpDeadline = safeInt(wp.deadline, -1);
+    let sum = 0n;
+    let winnerCovered = false;
+    for (const r of rewardsData) {
+      if (typeof r !== 'object' || r === null || !r.miner) return { ok: false, motivo: 'reward entry missing miner' };
+      const miner = normalizeAddr(r.miner);
+      const deadline = safeInt(r.deadline, -1);
+      if (deadline < 0) return { ok: false, motivo: 'reward entry has invalid deadline' };
+      let amount;
+      try { amount = BigInt(r.reward_cc || '0'); } catch { amount = 0n; }
+      if (amount < 0n) return { ok: false, motivo: 'reward entry has negative reward_cc' };
+      if (amount === 0n && totalReward > 0n) return { ok: false, motivo: 'reward entry must be positive' };
+      sum += amount;
+      if (miner === wpMiner && String(r.plot_id || '') === wpPlot && deadline === wpDeadline) winnerCovered = true;
+    }
+    if (sum !== totalReward) return { ok: false, motivo: 'reward entries must sum to the block reward' };
+    if (!winnerCovered) return { ok: false, motivo: 'no reward entry matches the winning proof' };
     return { ok: true };
   }
 
@@ -327,12 +340,6 @@ class Chain {
         if (!bloco.challenge_id) return { ok: false, motivo: 'block missing challenge_id' };
         const winnerProof = bloco.winner_proof && typeof bloco.winner_proof === 'object' ? bloco.winner_proof : {};
         const storedChallenge = this.db.prepare('SELECT * FROM mining_challenges WHERE challenge_id = ?').get(bloco.challenge_id);
-        // O challenge armazenado só é autoritativo se estiver FINALIZED. Um node
-        // que sincroniza pode ter uma linha parcial (criada localmente/gossipada,
-        // sem winner porque as provas foram submetidas a outro node). Nesse caso
-        // derivamos o challenge do próprio bloco: o winner_proof que ele transporta
-        // é verificado integralmente abaixo (assinatura do miner, merkle contra o
-        // plot commitment conhecido, target scoop e recomputação do deadline).
         const storedFinalized = !!(storedChallenge && storedChallenge.finalized_at &&
           storedChallenge.winner_miner && safeInt(storedChallenge.winner_deadline, -1) >= 0);
         const challenge = storedFinalized ? storedChallenge : {
@@ -361,26 +368,12 @@ class Chain {
         if (wpDeadline < 0) {
           return { ok: false, motivo: 'winner_proof has no deadline' };
         }
-        // O timestamp tem de respeitar o deadline ALEGADO na prova (recomputado
-        // criptograficamente mais abaixo), medido a partir do timestamp do
-        // PARENT — o único relógio em que todos os nodes concordam. O
-        // challenge.created_at é a hora local a que ESTE node viu a ponta
-        // (sempre posterior para quem sincroniza atrasado) e usá-lo aqui
-        // rejeitava blocos válidos. O mesmo miner pode ainda submeter plots
-        // diferentes a nodes diferentes; a legitimidade vem da assinatura,
-        // do scoop alvo, da merkle proof e do deadline recomputado.
         if (safeInt(bloco.timestamp, 0) < safeInt(parent.timestamp, 0) + wpDeadline) return { ok: false, motivo: 'block timestamp precedes winning deadline' };
         if (!wp.proof_signature) {
           return { ok: false, motivo: 'winner_proof not signed' };
         }
         const wpPkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(wpMiner)
           || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(wpMiner);
-        // A chave que assinou a prova PoC é do VENCEDOR, que nem sempre é o forger.
-        // bloco.miner_public_key é a chave de quem forjou o bloco, não de quem
-        // ganhou o desafio, logo NAO serve como fallback aqui. A chave tem de vir
-        // do winner_proof (blocos novos) ou de uma registry conhecida — incluindo
-        // peer_plot_commitments, que é como um node que sincroniza aprende a chave
-        // de miners que nunca registaram nada localmente.
         const peerPkRow = this.db.prepare('SELECT public_key FROM peer_plot_commitments WHERE lower(miner) = lower(?) AND public_key IS NOT NULL AND public_key != \'\' ORDER BY created_at DESC LIMIT 1').get(wpMiner);
         const wpCandidates = [
           String(wp.public_key || ''),
@@ -422,14 +415,6 @@ class Chain {
             return { ok: false, motivo: 'winner_proof merkle_root does not match committed plot root' };
           }
         } else {
-          // Sem commitment prévio conhecido: validar a prova de forma autónoma.
-          // Um node NÃO precisa de conhecer todos os plots da chain (Burst/Chia:
-          // a prova PoC é auto-suficiente; nada entra na chain até se ganhar).
-          // A vinculação à capacidade alegada vem da estrutura da prova: o nº
-          // exato de elementos varia com (scoop_index, total_scoops), por isso
-          // um root inventado com total_scoops falso não fecha a conta. Todo o
-          // resto (assinatura do vencedor, scoop alvo, merkle proof, challenge
-          // binding e deadline recomputado abaixo) corre igual nos dois caminhos.
           log('debug', `addBlock #${height}: plot ${wpPlotId.slice(0, 12)}… sem commitment local, validação autónoma`);
           const needProofLen = expectedMerkleProofLen(scoopIndex, totalScoops);
           if (merkleProof.length !== needProofLen) {
@@ -464,8 +449,6 @@ class Chain {
             }
           }
         }
-        // Always recompute the deadline against the authoritative challenge base target,
-        // never the miner-supplied one (a 2x larger bt halves the deadline).
         const recomputed = computeDeadline(scoopData, genSig, /^\d+$/.test(challengeBt) && BigInt(challengeBt) > 0n ? challengeBt : String(wpBaseTarget));
         if (recomputed !== wpDeadline) {
           return { ok: false, motivo: `PoC verification failed: computed deadline ${recomputed}s, claimed ${wpDeadline}s` };
@@ -502,7 +485,7 @@ class Chain {
         }
         log('debug', `addBlock forceSync h=${height} local=${existingAtHeight.hash.slice(0, 10)} remote=${bloco.hash.slice(0, 10)}`);
         const doomed = this.getBlockByHash(existingAtHeight.hash);
-        if (doomed && doomed.miner && doomed.miner !== 'genesis') this._rollbackRewardsForBlocks(doomed.miner, doomed.reward_cc);
+        if (doomed) this._rollbackRewardsForBlock(doomed.hash);
         if (doomed) this._rollbackPayoutsForBlock(doomed.hash);
         this.db.prepare('DELETE FROM contract_logs WHERE block_hash = ?').run(existingAtHeight.hash);
         this.db.prepare('DELETE FROM transactions WHERE block_hash = ?').run(existingAtHeight.hash);
@@ -880,13 +863,15 @@ class Chain {
     return { ok: true, motivo: 'reorganized', height: this.height, hash: this.bestHash };
   }
 
-  _rollbackRewardsForBlocks(miner, reward_cc) {
-    if (miner && miner !== 'genesis') {
-      const reward = BigInt(reward_cc || '0');
-      if (reward > 0n) {
-        const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(miner);
-        if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) - reward), Math.floor(Date.now() / 1000), miner);
-      }
+  _rollbackRewardsForBlock(blockHash) {
+    const rows = this.db.prepare('SELECT miner, reward_cc FROM block_rewards WHERE block_hash = ?').all(blockHash);
+    const now = Math.floor(Date.now() / 1000);
+    for (const r of rows) {
+      if (!r.miner || r.miner === 'genesis') continue;
+      const reward = BigInt(r.reward_cc || '0');
+      if (reward <= 0n) continue;
+      const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(r.miner);
+      if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) - reward), now, r.miner);
     }
   }
 
@@ -907,7 +892,7 @@ class Chain {
     const doRollback = (doomed) => {
       for (const d of doomed) {
         if (d.height > retainThroughHeight) {
-          this._rollbackRewardsForBlocks(d.miner, d.reward_cc);
+          this._rollbackRewardsForBlock(d.hash);
           this._rollbackPayoutsForBlock(d.hash);
         }
       }
@@ -1020,13 +1005,17 @@ class Chain {
           const txHash = tx.hash || hashTransaction(tx);
           this.db.prepare('INSERT OR REPLACE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data, chain_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx.fee || 0), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', blk.height, tx.timestamp || now, blk.hash, String(tx.data || ''), String(tx.chain_id || blk.chain_id || this.cfg.chainId || '0'));
         }
-        if (blk.miner && blk.miner !== 'genesis' && blk.height > 0) {
-          const reward = BigInt(blk.reward_cc || '0');
-          if (reward > 0n) {
-            const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(blk.miner);
-            if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) + reward), now, blk.miner);
-            else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(blk.miner, String(reward), 0, now, now);
-          }
+        const entries = Array.isArray(blk.rewards) && blk.rewards.length ? blk.rewards : [{ miner: blk.miner, reward_cc: blk.reward_cc }];
+        for (const e of entries) {
+          const m = e && e.miner ? String(e.miner).toLowerCase() : '';
+          if (!m || m === 'genesis' || blk.height <= 0) continue;
+          const reward = BigInt((e && e.reward_cc) || '0');
+          if (reward <= 0n) continue;
+          const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(m);
+          if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) + reward), now, m);
+          else this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(m, String(reward), 0, now, now);
+          this.db.prepare('INSERT OR IGNORE INTO block_rewards (block_height, block_hash, challenge_id, miner, plot_id, size_gb, reward_cc, created_at) VALUES (?,?,?,?,?,?,?,?)')
+            .run(blk.height, blk.hash, blk.challenge_id || '', m, (e && e.plot_id) || '', Number((e && e.size_gb) || 0), String(reward), now);
         }
         if (contractExec && contractExec.backup && contractExec.backup.length) {
           this._recordContractStateChanges(blk.height, blk.hash, contractExec.backup);
@@ -1576,5 +1565,6 @@ class contracts_Manager {
 }
 
 const FINALIZATION_DEPTH = Config.Configuration.FINALIZATION_DEPTH;
+const MAX_REWARD_ENTRIES = 256;
 
-module.exports = { Chain, Config, Diff_Manager, MemPool_Manager, contracts_Manager, FINALIZATION_DEPTH };
+module.exports = { Chain, Config, Diff_Manager, MemPool_Manager, contracts_Manager, FINALIZATION_DEPTH, MAX_REWARD_ENTRIES };

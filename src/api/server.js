@@ -448,9 +448,6 @@ app.get('/api/state', (req, res) => {
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
-      // Pull on-demand: se o plot é desconhecido, vai buscá-lo aos peers em vez
-      // de rejeitar (substitui o push do plotsGossip). Nunca bloqueia provas
-      // de plots já conhecidos nem lança.
       const mAddr = String(miner).toLowerCase();
       const knownPlot = this.db.prepare('SELECT 1 FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr)
         || this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr);

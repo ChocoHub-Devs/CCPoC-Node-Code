@@ -343,10 +343,6 @@ class ChallengeManager {
       log('warn', `[FORGE] winner submission for challenge ${challenge.challenge_id.slice(0, 12)} predates PoC packet recordkeeping; skipping forge`);
       return null;
     }
-    // A chave que assinou a prova PoC é do VENCEDOR, que nem sempre é o forger.
-    // Sem a public_key aqui dentro, um node que sincroniza só tem a
-    // bloco.miner_public_key (a do forger) para verificar — e a verificação
-    // falha sempre que miner != forger. O winner_proof tem de ser autónomo.
     const winnerPkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(winner.miner)
       || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(winner.miner);
     const winnerProof = {

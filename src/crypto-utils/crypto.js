@@ -362,14 +362,6 @@ function verifyMerkleProofBuf(leafHash, leafIndex, totalLeaves, proof, root) {
   return hash.equals(rootBuf);
 }
 
-// Nº exato de elementos que uma prova válida tem de ter para
-// (leafIndex, totalLeaves) nesta construção (duplica o último quando ímpar).
-// É a réplica exata do consumo de computeMerkleProof/verifyMerkleProofBuf:
-// 1 elemento por nível, exceto nos níveis onde o caminho passa pelo último
-// de um nível ímpar (auto-hash, sem elemento). Serve para vincular a
-// capacidade alegada (total_scoops) à estrutura da prova quando não há
-// commitment prévio conhecido: um root inventado com total_scoops falso
-// não fecha a conta.
 function expectedMerkleProofLen(leafIndex, totalLeaves) {
   let idx = leafIndex;
   let count = totalLeaves;

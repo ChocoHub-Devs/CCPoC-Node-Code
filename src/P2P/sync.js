@@ -87,11 +87,6 @@ class SyncEngine {
     }));
   }
 
-  // Pull on-demand (substitui o push do plotsGossip): quando uma prova é
-  // submetida para um plot desconhecido, vai buscar o commitment aos peers,
-  // verifica assinatura/VRF e guarda em cache. O miner regista-se uma vez
-  // num node qualquer; o resto da rede aprende por aqui, sem chatter de fundo.
-  // Devolve a linha do commitment ou null. Nunca lança.
   async fetchPlotCommitment(miner, plotId) {
     try {
       const m = String(miner || '').toLowerCase();
