@@ -155,10 +155,21 @@ class Chain {
     const plot = r.plot_id || '';
     const deadline = safeInt(r.deadline, -1);
     if (deadline < 0) return { ok: false, motivo: 'reward entry has invalid deadline' };
-    const key = `${miner}:${plot}:${deadline}`;
-    if (subKeys && !subKeys.has(key)) {
-      log('warn', `reward entry for ${miner} has no matching submission in challenge ${(bloco.challenge_id || '').slice(0, 12)}`);
-      return { ok: false, motivo: `reward for ${miner} has no matching proof submission` };
+    const wp = bloco.winner_proof && typeof bloco.winner_proof === 'object' ? bloco.winner_proof : null;
+    if (wp) {
+      // A recompensa tem de corresponder à prova vencedora QUE O BLOCO TRAZ
+      // (assinatura, scoop, merkle e deadline já verificados acima) — não às
+      // submissões que este node observou: o mesmo miner pode submeter plots
+      // diferentes a nodes diferentes, e cada node só vê parte das provas.
+      if (normalizeAddr(wp.miner || '') !== miner) return { ok: false, motivo: 'reward miner does not match winner_proof miner' };
+      if (String(wp.plot_id || '') !== plot) return { ok: false, motivo: 'reward plot does not match winner_proof plot' };
+      if (safeInt(wp.deadline, -1) !== deadline) return { ok: false, motivo: 'reward deadline does not match winner_proof deadline' };
+    } else {
+      const key = `${miner}:${plot}:${deadline}`;
+      if (subKeys && !subKeys.has(key)) {
+        log('warn', `reward entry for ${miner} has no matching submission in challenge ${(bloco.challenge_id || '').slice(0, 12)}`);
+        return { ok: false, motivo: `reward for ${miner} has no matching proof submission` };
+      }
     }
     let reward;
     try { reward = BigInt(r.reward_cc || '0'); } catch { reward = 0n; }
@@ -338,7 +349,6 @@ class Chain {
         const expectedChallengeId = sha256hex(`${String(challenge.challenge_seed || '')}:${String(parent.hash)}`);
         if (String(bloco.challenge_id) !== expectedChallengeId) return { ok: false, motivo: 'challenge is not bound to parent' };
         if (safeInt(challenge.block_height, -1) !== parent.height) return { ok: false, motivo: 'challenge height does not match parent' };
-        if (safeInt(bloco.timestamp, 0) < safeInt(challenge.created_at, 0) + safeInt(challenge.winner_deadline, 0)) return { ok: false, motivo: 'block timestamp precedes winning deadline' };
         const wp = bloco.winner_proof;
         if (!wp || typeof wp !== 'object') {
           return { ok: false, motivo: 'block missing winner_proof for challenge' };
@@ -352,7 +362,14 @@ class Chain {
         if (wpDeadline < 0) {
           return { ok: false, motivo: 'winner_proof has no deadline' };
         }
-        if (wpDeadline !== safeInt(challenge.winner_deadline, -1)) return { ok: false, motivo: 'winner_proof deadline is not finalized challenge deadline' };
+        // O timestamp tem de respeitar o deadline ALEGADO na prova (recomputado
+        // criptograficamente mais abaixo), não o melhor deadline que este node
+        // observou: o mesmo miner pode submeter provas de plots diferentes a
+        // nodes diferentes, e cada node finaliza com o melhor que viu. Exigir
+        // igualdade com o registo local bifurcava a rede em forks
+        // irreconciliáveis; a legitimidade vem da assinatura, do scoop alvo,
+        // da merkle proof e do deadline recomputado.
+        if (safeInt(bloco.timestamp, 0) < safeInt(challenge.created_at, 0) + wpDeadline) return { ok: false, motivo: 'block timestamp precedes winning deadline' };
         if (!wp.proof_signature) {
           return { ok: false, motivo: 'winner_proof not signed' };
         }
