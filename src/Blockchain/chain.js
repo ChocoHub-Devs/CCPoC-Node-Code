@@ -358,7 +358,23 @@ class Chain {
         }
         const wpPkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(wpMiner)
           || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(wpMiner);
-        const wpPk = (wpPkRow && wpPkRow.public_key_secp256k1) || bloco.miner_public_key;
+        // A chave que assinou a prova PoC é do VENCEDOR, que nem sempre é o forger.
+        // bloco.miner_public_key é a chave de quem forjou o bloco, não de quem
+        // ganhou o desafio, logo NAO serve como fallback aqui. A chave tem de vir
+        // do winner_proof (blocos novos) ou de uma registry conhecida — incluindo
+        // peer_plot_commitments, que é como um node que sincroniza aprende a chave
+        // de miners que nunca registaram nada localmente.
+        const peerPkRow = this.db.prepare('SELECT public_key FROM peer_plot_commitments WHERE lower(miner) = lower(?) AND public_key IS NOT NULL AND public_key != \'\' ORDER BY created_at DESC LIMIT 1').get(wpMiner);
+        const wpCandidates = [
+          String(wp.public_key || ''),
+          String((wpPkRow && wpPkRow.public_key_secp256k1) || ''),
+          String((peerPkRow && peerPkRow.public_key) || ''),
+        ];
+        let wpPk = '';
+        for (const cand of wpCandidates) {
+          if (!cand) continue;
+          try { if (pubkeyToAddress(cand).toLowerCase() === wpMiner) { wpPk = cand; break; } } catch { /* candidate inválido, tentar a próxima */ }
+        }
         if (!wpPk) {
           return { ok: false, motivo: 'winner_proof miner has no public key' };
         }

@@ -94,7 +94,8 @@ function initDB(dbPath, cfg) {
 
     CREATE TABLE IF NOT EXISTS plot_commitments (
       plot_id TEXT, miner TEXT, merkle_root TEXT, size_gb REAL,
-      created_at INTEGER, PRIMARY KEY(plot_id, miner)
+      created_at INTEGER, public_key TEXT DEFAULT '', signature TEXT DEFAULT '',
+      PRIMARY KEY(plot_id, miner)
     );
 
     CREATE TABLE IF NOT EXISTS peer_plot_commitments (
@@ -210,6 +211,11 @@ function initDB(dbPath, cfg) {
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_output TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_proof TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_verified INTEGER DEFAULT 0').run(); } catch {}
+  // Chave pública e assinatura ORIGINAIS do miner. Sem elas o node re-criava a
+  // assinatura com a sua própria chave ao gossipar plots de terceiros, e os
+  // peers rejeitavam com "address does not match public key".
+  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch {}
+  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN signature TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN merkle_root TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_public_key TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_output TEXT DEFAULT ""').run(); } catch {}
