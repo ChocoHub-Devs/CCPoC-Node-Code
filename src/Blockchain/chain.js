@@ -315,7 +315,15 @@ class Chain {
         if (!bloco.challenge_id) return { ok: false, motivo: 'block missing challenge_id' };
         const winnerProof = bloco.winner_proof && typeof bloco.winner_proof === 'object' ? bloco.winner_proof : {};
         const storedChallenge = this.db.prepare('SELECT * FROM mining_challenges WHERE challenge_id = ?').get(bloco.challenge_id);
-        const challenge = storedChallenge || {
+        // O challenge armazenado só é autoritativo se estiver FINALIZED. Um node
+        // que sincroniza pode ter uma linha parcial (criada localmente/gossipada,
+        // sem winner porque as provas foram submetidas a outro node). Nesse caso
+        // derivamos o challenge do próprio bloco: o winner_proof que ele transporta
+        // é verificado integralmente abaixo (assinatura do miner, merkle contra o
+        // plot commitment conhecido, target scoop e recomputação do deadline).
+        const storedFinalized = !!(storedChallenge && storedChallenge.finalized_at &&
+          storedChallenge.winner_miner && safeInt(storedChallenge.winner_deadline, -1) >= 0);
+        const challenge = storedFinalized ? storedChallenge : {
           challenge_id: bloco.challenge_id,
           challenge_seed: String(winnerProof.challenge_seed || ''),
           block_height: height - 1,
