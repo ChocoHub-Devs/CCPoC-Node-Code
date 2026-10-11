@@ -1,5 +1,5 @@
 const { URL } = require('url');
-const { safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate } = require('../crypto-utils/crypto');
+const { safeInt, safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate } = require('../crypto-utils/crypto');
 const { makeLocalAnnouncement, verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
@@ -358,7 +358,7 @@ class SyncEngine {
 
   async plotsGossip() {
     try {
-      const rows = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof FROM plot_commitments').all();
+      const rows = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, public_key, signature FROM plot_commitments').all();
       const announcements = [];
       for (const plot of rows) {
         if (!plot.merkle_root) continue;
@@ -396,8 +396,8 @@ class SyncEngine {
               if (!check.ok) { log('debug', `[P2P] Rejected peer plot announce (${check.motivo}) from ${peer.url}`); continue; }
               const exists = this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND miner = ? AND node_url = ?').get(String(ann.plot_id), String(ann.miner).toLowerCase(), originUrl);
               if (!exists) {
-                this.db.prepare('INSERT OR IGNORE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-                  .run(String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root), parseFloat(ann.size_gb) || 0, originUrl,
+                this.db.prepare('INSERT OR IGNORE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+                  .run(String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root), parseFloat(ann.size_gb) || 0, safeInt(ann.total_scoops, 0), originUrl,
                     String(ann.vrf_public_key || ''), String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
                     String(ann.signature || ''), String(ann.public_key || ''), Math.floor(Date.now() / 1000));
                 stored++;

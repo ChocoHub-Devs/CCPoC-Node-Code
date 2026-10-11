@@ -1,4 +1,4 @@
-const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, evmTxHash, keccak256, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, plotScoopCount, MINING_SCOOP_MODULUS, computeDeadline, verifyMerkleProofBuf, pubkeyToAddress, recoverTransactionSender } = require('../crypto-utils/crypto');
+const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, evmTxHash, keccak256, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, plotScoopCount, MINING_SCOOP_MODULUS, computeDeadline, expectedMerkleProofLen, verifyMerkleProofBuf, pubkeyToAddress, recoverTransactionSender } = require('../crypto-utils/crypto');
 
 const { IncrementalStateRoot } = require('./state-trie');
 const { ZkpService } = require('../crypto-utils/zkp-service');
@@ -400,11 +400,24 @@ class Chain {
         }
         const knownPlot = this.db.prepare('SELECT merkle_root, size_gb FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(wpPlotId, wpMiner)
           || this.db.prepare('SELECT merkle_root, size_gb FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(wpPlotId, wpMiner);
-        if (!knownPlot || !knownPlot.merkle_root) {
-          return { ok: false, motivo: 'winner_proof references a plot commitment unknown to this node' };
-        }
-        if (knownPlot.merkle_root.toLowerCase() !== merkleRootClaim.toLowerCase()) {
-          return { ok: false, motivo: 'winner_proof merkle_root does not match committed plot root' };
+        if (knownPlot && knownPlot.merkle_root) {
+          if (knownPlot.merkle_root.toLowerCase() !== merkleRootClaim.toLowerCase()) {
+            return { ok: false, motivo: 'winner_proof merkle_root does not match committed plot root' };
+          }
+        } else {
+          // Sem commitment prévio conhecido: validar a prova de forma autónoma.
+          // Um node NÃO precisa de conhecer todos os plots da chain (Burst/Chia:
+          // a prova PoC é auto-suficiente; nada entra na chain até se ganhar).
+          // A vinculação à capacidade alegada vem da estrutura da prova: o nº
+          // exato de elementos varia com (scoop_index, total_scoops), por isso
+          // um root inventado com total_scoops falso não fecha a conta. Todo o
+          // resto (assinatura do vencedor, scoop alvo, merkle proof, challenge
+          // binding e deadline recomputado abaixo) corre igual nos dois caminhos.
+          log('debug', `addBlock #${height}: plot ${wpPlotId.slice(0, 12)}… sem commitment local, validação autónoma`);
+          const needProofLen = expectedMerkleProofLen(scoopIndex, totalScoops);
+          if (merkleProof.length !== needProofLen) {
+            return { ok: false, motivo: `winner_proof merkle proof length ${merkleProof.length} inconsistent with scoop_index ${scoopIndex} for ${totalScoops} scoops (expected ${needProofLen})` };
+          }
         }
         const expectedTargetIdx = challenge.target_scoop_index != null
           ? safeInt(challenge.target_scoop_index, -1)

@@ -520,8 +520,8 @@ app.get('/api/state', (req, res) => {
         } catch { return res.status(400).json({ error: 'invalid VRF capacity commitment' }); }
       }
       const now = Math.floor(Date.now() / 1000);
-      this.db.prepare('INSERT OR REPLACE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, vrf_verified, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
-        .run(plot_id, normalizedAddress, merkle_root, parsedSize, safeInt(total_scoops, 0), vrfPublicKey, vrfOutput, JSON.stringify(vrfProof || ''), vrfVerified, now);
+      this.db.prepare('INSERT OR REPLACE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, vrf_verified, public_key, signature, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(plot_id, normalizedAddress, merkle_root, parsedSize, safeInt(total_scoops, 0), vrfPublicKey, vrfOutput, JSON.stringify(vrfProof || ''), vrfVerified, public_key, signature, now);
       const existingUser = this.db.prepare('SELECT address FROM user_keys WHERE lower(address) = lower(?)').get(normalizedAddress);
       if (!existingUser) {
         this.db.prepare('INSERT INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?, ?, ?, ?)').run(normalizedAddress, public_key, now, now);
@@ -564,7 +564,7 @@ app.get('/api/state', (req, res) => {
     });
 
     app.get('/api/plots/announced', (req, res) => {
-      const rows = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof FROM plot_commitments').all();
+      const rows = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, public_key, signature FROM plot_commitments').all();
       const plots = [];
       for (const plot of rows) {
         if (!plot.merkle_root) continue;

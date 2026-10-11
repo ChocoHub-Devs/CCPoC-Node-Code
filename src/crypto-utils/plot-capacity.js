@@ -7,6 +7,17 @@ function makeLocalAnnouncement(plot, cfg, vrfOverrides = null) {
   const miner = String(plot.miner || '').toLowerCase();
   const merkleRoot = String(plot.merkle_root || '');
   const publicKey = String(plot.public_key || cfg.minerPublicKey || '');
+  // Guarda anti-fabricação: sem chave, ou com chave que não deriva para o
+  // endereço do miner, o anúncio seria sempre rejeitado pelos peers
+  // ("address does not match public key"). Devolver null para o chamador
+  // saltar a linha em vez de espalhar lixo (era o Bug B: o node re-assinava
+  // plots de terceiros com a sua própria chave). Linhas legacy sem chave
+  // ficam usáveis localmente para minerar, mas não circulam no gossip.
+  if (!publicKey) return null;
+  try {
+    const { pubkeyToAddress } = require('./crypto');
+    if (pubkeyToAddress(publicKey).toLowerCase() !== miner) return null;
+  } catch { return null; }
   const privateKey = String(plot.private_key !== undefined ? plot.private_key : (cfg.minerPrivateKey || ''));
   const sizeGb = plot.size_gb;
   const totalScoops = safeInt(plot.total_scoops, 0) || 0;
@@ -39,7 +50,14 @@ function makeLocalAnnouncement(plot, cfg, vrfOverrides = null) {
     public_key: publicKey,
     node_url: cfg.nodeUrl || '',
   };
-  if (publicKey) {
+  // Reutilizar a assinatura original enviada pelo miner no registo. Um node NÃO
+  // deve re- assinar o anúncio com a sua própria private key: para plots de
+  // terceiros isso produz um anúncio inválido (a public_key do node não
+  // corresponde ao endereço do miner) e todos os peers o rejeitam com
+  // "address does not match public key".
+  if (plot.signature) {
+    ann.signature = String(plot.signature);
+  } else if (publicKey) {
     try {
       ann.signature = signMessage(plotRegisterMessage(miner, ann.plot_id, merkleRoot, String(sizeGb), String(totalScoops)), privateKey || '');
     } catch { ann.signature = ''; }

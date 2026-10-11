@@ -100,7 +100,7 @@ function initDB(dbPath, cfg) {
 
     CREATE TABLE IF NOT EXISTS peer_plot_commitments (
       plot_id TEXT, miner TEXT, size_gb REAL, node_url TEXT,
-      created_at INTEGER, PRIMARY KEY(plot_id, miner, node_url)
+      created_at INTEGER, total_scoops INTEGER DEFAULT 0, PRIMARY KEY(plot_id, miner, node_url)
     );
 
     CREATE TABLE IF NOT EXISTS block_rewards (
@@ -222,6 +222,9 @@ function initDB(dbPath, cfg) {
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_proof TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN signature TEXT DEFAULT ""').run(); } catch {}
   try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch {};
+  // total_scoops faz parte da mensagem assinada; sem o valor exato o relay
+  // multi-hop não consegue re-servir o anúncio sem invalidar a assinatura.
+  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN total_scoops INTEGER DEFAULT 0').run(); } catch {}
   try { db.prepare("ALTER TABLE transactions ADD COLUMN chain_id TEXT DEFAULT ''").run(); } catch {}
 
   const chainIdDefault = String(cfg.chainId || '0');

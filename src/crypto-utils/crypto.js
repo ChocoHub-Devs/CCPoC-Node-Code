@@ -362,6 +362,27 @@ function verifyMerkleProofBuf(leafHash, leafIndex, totalLeaves, proof, root) {
   return hash.equals(rootBuf);
 }
 
+// Nº exato de elementos que uma prova válida tem de ter para
+// (leafIndex, totalLeaves) nesta construção (duplica o último quando ímpar).
+// É a réplica exata do consumo de computeMerkleProof/verifyMerkleProofBuf:
+// 1 elemento por nível, exceto nos níveis onde o caminho passa pelo último
+// de um nível ímpar (auto-hash, sem elemento). Serve para vincular a
+// capacidade alegada (total_scoops) à estrutura da prova quando não há
+// commitment prévio conhecido: um root inventado com total_scoops falso
+// não fecha a conta.
+function expectedMerkleProofLen(leafIndex, totalLeaves) {
+  let idx = leafIndex;
+  let count = totalLeaves;
+  let need = 0;
+  while (count > 1) {
+    const isOddLast = (count % 2 === 1 && idx === count - 1);
+    if (!isOddLast) need++;
+    idx = Math.floor(idx / 2);
+    count = Math.ceil(count / 2);
+  }
+  return need;
+}
+
 function safeInt(value, def = 0) {
   const n = parseInt(value, 10);
   return isNaN(n) ? def : n;
@@ -768,7 +789,7 @@ module.exports = {
   secpAddressFromPrivate, privateKeyToAddress, toChecksumAddress, isValidAddress, recoverPublicKey, recoverPublicKeyForAddress,
   pubkeyToAddress, pubKeyToAddress, signMessage, verifySignature,
   evmTxDigest, evmTxHash, signTransactionTx, recoverTransactionSender, signatureToHex, signatureFromHex,
-  merkleRoot, merkleRootBuffer, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf,
+  merkleRoot, merkleRootBuffer, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf, expectedMerkleProofLen,
   canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage, plotRegisterMessage,
   computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, calculateMiningReward, isBetterChainCandidate,
   SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, PLOT_FORMAT_V3, merkleTreeInternalNodeCount, plotScoopCount, plotScoopCountOrig,
