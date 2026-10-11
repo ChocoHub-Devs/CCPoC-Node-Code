@@ -1,5 +1,4 @@
 const WebSocket = require('ws');
-const { verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { log } = require('../../config/config');
 
 class P2PWebSocketServer {
@@ -24,29 +23,6 @@ class P2PWebSocketServer {
     this._messageHandlers.set('ping', (ws, msg) => ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() })));
     this._messageHandlers.set('new_block', (ws, msg) => this._handleNewBlock(ws, msg));
     this._messageHandlers.set('new_tx', (ws, msg) => this._handleNewTx(ws, msg));
-    this._messageHandlers.set('plot_announce', (ws, msg) => this._handlePlotAnnounce(ws, msg));
-  }
-
-  _handlePlotAnnounce(ws, msg) {
-    const announcements = (msg && msg.data && msg.data.announcements) || (msg && msg.announcements) || [];
-    const nodeUrl = (msg && msg.data && msg.data.node_url) || (msg && msg.node_url) || '';
-    if (!Array.isArray(announcements) || !announcements.length) return;
-    if (announcements.length > 2000) return;
-    const now = Math.floor(Date.now() / 1000);
-    let stored = 0;
-    for (const ann of announcements) {
-      const check = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
-      if (!check.ok) continue;
-      const exists = this.chain.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND miner = ? AND node_url = ?').get(String(ann.plot_id), String(ann.miner).toLowerCase(), nodeUrl);
-      if (exists) continue;
-      this.chain.db.prepare('INSERT OR IGNORE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-        .run(String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root), parseFloat(ann.size_gb) || 0, nodeUrl,
-          String(ann.vrf_public_key || ''), String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
-          String(ann.signature || ''), String(ann.public_key || ''), now);
-      stored++;
-    }
-    if (stored > 0) log('debug', `[P2P] WS plot announce: stored ${stored} verified plots from ${nodeUrl || ws.peerIp}`);
-    try { ws.send(JSON.stringify({ type: 'plot_announce_ack', accepted: stored })); } catch {}
   }
 
   _handleSubscribe(ws, msg) {
@@ -322,11 +298,6 @@ class P2PWebSocketClient {
 
   _flushQueue() {
     while (this._messageQueue.length) this._send(this._messageQueue.shift());
-  }
-
-  announcePlots(announcements, nodeUrl) {
-    if (!announcements || !announcements.length) return;
-    this._send({ type: 'plot_announce', data: { node_url: nodeUrl || '', announcements } });
   }
 
   _handleMessage(msg) {

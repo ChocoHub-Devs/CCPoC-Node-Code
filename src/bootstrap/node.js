@@ -104,7 +104,6 @@ class ChocoNode {
       setInterval(() => { try { if (!this.db || this.db.open === false) return; this.challengeMgr.finalizeExpiredChallenges(this.chain, this.sync).catch(e => log('error', `Finalize error: ${e.message}`)); } catch {} }, 5000),
       setInterval(() => { this.sync.loopSync().catch(() => {}); }, cfg.syncIntervalMs || 10000),
       setInterval(() => { this.sync.heartbeat().catch(() => {}); }, cfg.heartbeatMs || 20000),
-      setInterval(() => { this.sync.plotsGossip().catch(() => {}); }, Math.max(30000, (cfg.heartbeatMs || 20000) * 3)),
       setInterval(() => { this.sync.discoverPeers().catch(() => {}); }, cfg.discoveryMs || 30000),
     ];
 

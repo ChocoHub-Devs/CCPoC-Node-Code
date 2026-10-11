@@ -1,6 +1,6 @@
 const { URL } = require('url');
 const { safeInt, safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate } = require('../crypto-utils/crypto');
-const { makeLocalAnnouncement, verifyAnnouncement } = require('../crypto-utils/plot-capacity');
+const { verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
 
@@ -87,8 +87,65 @@ class SyncEngine {
     }));
   }
 
-  async _syncPeerPlots(peerUrl) {
+  // Pull on-demand (substitui o push do plotsGossip): quando uma prova é
+  // submetida para um plot desconhecido, vai buscar o commitment aos peers,
+  // verifica assinatura/VRF e guarda em cache. O miner regista-se uma vez
+  // num node qualquer; o resto da rede aprende por aqui, sem chatter de fundo.
+  // Devolve a linha do commitment ou null. Nunca lança.
+  async fetchPlotCommitment(miner, plotId) {
     try {
+      const m = String(miner || '').toLowerCase();
+      const pid = String(plotId || '');
+      if (!m || !pid) return null;
+      const local = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(pid, m)
+        || this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(pid, m);
+      if (local && local.merkle_root) return local;
+      const selfHost = (() => { try { return this.cfg.nodeUrl ? new (require('url').URL)(this.cfg.nodeUrl).hostname : null; } catch { return null; } })();
+      const targets = [...new Set([...(this.cfg.seedPeers || []), ...this.peers.active(6).map(p => p.url)])]
+        .filter(u => { try { return new (require('url').URL)(u).hostname !== selfHost; } catch { return true; } })
+        .slice(0, 6);
+      if (!targets.length) return null;
+      const paths = [`/api/poc/plots/${m}`, '/api/plots/announced'];
+      const jobs = [];
+      for (const base of targets) {
+        for (const path of paths) {
+          jobs.push(fetchJSON(`${base.replace(/\/+$/, '')}${path}`, { timeout: 6 }).then(data => ({ base, data })).catch(() => null));
+        }
+      }
+      const results = await Promise.allSettled(jobs);
+      for (const r of results) {
+        if (!r || r.status !== 'fulfilled' || !r.value || !r.value.data) continue;
+        const { base, data } = r.value;
+        const cands = Array.isArray(data) ? data : (Array.isArray(data.plots) ? data.plots : []);
+        for (const ann of cands) {
+          if (!ann || String(ann.plot_id) !== pid || String(ann.miner).toLowerCase() !== m) continue;
+          const norm = {
+            miner: m, plot_id: pid,
+            merkle_root: String(ann.merkle_root || ''),
+            size_gb: parseFloat(ann.size_gb) || 0,
+            total_scoops: safeInt(ann.total_scoops, 0),
+            vrf_public_key: String(ann.vrf_public_key || ''),
+            vrf_output: String(ann.vrf_output || ''),
+            vrf_proof: ann.vrf_proof,
+            public_key: String(ann.public_key || ''),
+            signature: String(ann.signature || ''),
+          };
+          try { if (typeof norm.vrf_proof === 'string' && norm.vrf_proof) norm.vrf_proof = JSON.parse(norm.vrf_proof); } catch { norm.vrf_proof = ''; }
+          const check = verifyAnnouncement(norm, { requireVrf: true, requireSig: true });
+          if (!check.ok) continue;
+          this.db.prepare('INSERT OR REPLACE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+            .run(pid, m, norm.merkle_root, norm.size_gb, norm.total_scoops, base,
+              norm.vrf_public_key, norm.vrf_output, JSON.stringify(norm.vrf_proof || ''),
+              norm.signature, norm.public_key, Math.floor(Date.now() / 1000));
+          log('info', `[P2P] Plot ${pid.slice(0, 12)}… de ${m.slice(0, 12)}… aprendido de ${base} (on-demand)`);
+          return this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(pid, m);
+        }
+      }
+    } catch (e) { log('debug', `fetchPlotCommitment falhou: ${e.message}`); }
+    return null;
+  }
+
+  async _syncPeerPlots(peerUrl) {    try {
       const data = await fetchJSON(`${peerUrl.replace(/\/+$/, '')}/api/plots/announced`, { timeout: 10 });
       if (!data || !Array.isArray(data.plots)) return 0;
       const originUrl = String(data.node_url || peerUrl);
@@ -97,10 +154,10 @@ class SyncEngine {
         const check = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
         if (!check.ok) continue;
         this.db.prepare(`INSERT OR REPLACE INTO peer_plot_commitments
-          (plot_id, miner, merkle_root, size_gb, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+          (plot_id, miner, merkle_root, size_gb, total_scoops, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
           String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root),
-          parseFloat(ann.size_gb) || 0, originUrl, String(ann.vrf_public_key || ''),
+          parseFloat(ann.size_gb) || 0, safeInt(ann.total_scoops, 0), originUrl, String(ann.vrf_public_key || ''),
           String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
           String(ann.signature || ''), String(ann.public_key || ''), Math.floor(Date.now() / 1000),
         );
@@ -354,60 +411,6 @@ class SyncEngine {
         }
       } catch { this.peers.fail(peer.url); }
     }));
-  }
-
-  async plotsGossip() {
-    try {
-      const rows = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, public_key, signature FROM plot_commitments').all();
-      const announcements = [];
-      for (const plot of rows) {
-        if (!plot.merkle_root) continue;
-        let vrfProof = plot.vrf_proof;
-        try { vrfProof = plot.vrf_proof ? JSON.parse(plot.vrf_proof) : ''; } catch {}
-        announcements.push(makeLocalAnnouncement(plot, this.cfg, {
-          public_key: plot.vrf_public_key || '',
-          output: plot.vrf_output || '',
-          proof: vrfProof,
-        }));
-      }
-      const peers = this.peers.active(10).filter(p => {
-        try { const u = new (require('url').URL)(p.url); if (this.cfg.nodeUrl && u.hostname === new (require('url').URL)(this.cfg.nodeUrl).hostname) return false; } catch {} return true;
-      });
-      if (!peers.length) return;
-
-      const selfHost = (() => { try { return this.cfg.nodeUrl ? new (require('url').URL)(this.cfg.nodeUrl).hostname : null; } catch { return null; } })();
-      let stored = 0, relayed = 0;
-      await Promise.allSettled(peers.map(async (peer) => {
-        try {
-          if (announcements.length) {
-            const res = await fetchJSON(`${peer.url}/api/plots/announce`, {
-              method: 'POST', body: { node_url: this.cfg.nodeUrl || '', plots: announcements }, timeout: 8,
-            });
-            if (res && typeof res.accepted === 'number') relayed += res.accepted;
-          }
-          const peerPlots = await fetchJSON(`${peer.url}/api/plots/announced`, { timeout: 8 });
-          if (peerPlots && Array.isArray(peerPlots.plots)) {
-            const originUrl = peerPlots.node_url || peer.url;
-            for (const ann of peerPlots.plots) {
-              try {
-                if (selfHost && originUrl && new (require('url').URL)(originUrl).hostname === selfHost) continue; // ignore self
-              } catch {}
-              const check = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
-              if (!check.ok) { log('debug', `[P2P] Rejected peer plot announce (${check.motivo}) from ${peer.url}`); continue; }
-              const exists = this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND miner = ? AND node_url = ?').get(String(ann.plot_id), String(ann.miner).toLowerCase(), originUrl);
-              if (!exists) {
-                this.db.prepare('INSERT OR IGNORE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-                  .run(String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root), parseFloat(ann.size_gb) || 0, safeInt(ann.total_scoops, 0), originUrl,
-                    String(ann.vrf_public_key || ''), String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
-                    String(ann.signature || ''), String(ann.public_key || ''), Math.floor(Date.now() / 1000));
-                stored++;
-              }
-            }
-          }
-        } catch {}
-      }));
-      if (stored > 0 || relayed > 0) log('debug', `[P2P] Plots gossip: relayed ${relayed}, stored ${stored} verified peer plots`);
-    } catch (e) { log('warn', `[P2P] Plots gossip error: ${e.message}`); }
   }
 
   async announce() {

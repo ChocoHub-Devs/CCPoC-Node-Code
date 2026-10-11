@@ -443,11 +443,20 @@ app.get('/api/state', (req, res) => {
       res.json(ch);
     });
 
-    app.post('/api/mining/submit-proof', mutationLimiter, (req, res) => {
+    app.post('/api/mining/submit-proof', mutationLimiter, async (req, res) => {
       const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
+      // Pull on-demand: se o plot é desconhecido, vai buscá-lo aos peers em vez
+      // de rejeitar (substitui o push do plotsGossip). Nunca bloqueia provas
+      // de plots já conhecidos nem lança.
+      const mAddr = String(miner).toLowerCase();
+      const knownPlot = this.db.prepare('SELECT 1 FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr)
+        || this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr);
+      if (!knownPlot && this.sync && typeof this.sync.fetchPlotCommitment === 'function') {
+        await this.sync.fetchPlotCommitment(miner, plot_id).catch(() => null);
+      }
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       if (!result.ok) return res.status(400).json({ error: result.motivo });
       log('info', `[MINERS] Proof submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
@@ -536,31 +545,6 @@ app.get('/api/state', (req, res) => {
       const ann = req.body || {};
       const result = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
       res.json({ ok: result.ok, verified: result.ok, motivo: result.motivo || null });
-    });
-
-    app.post('/api/plots/announce', p2pLimiter, (req, res) => {
-      const { node_url, plots } = req.body || {};
-      if (!Array.isArray(plots) || plots.length === 0) return res.json({ ok: true, accepted: 0 });
-      if (plots.length > 5000) return res.status(400).json({ error: 'too many announcements' });
-      const originUrl = node_url || this.cfg.nodeUrl || '';
-      const selfHost = (() => { try { return this.cfg.nodeUrl ? new (require('url').URL)(this.cfg.nodeUrl).hostname : null; } catch { return null; } })();
-      const now = Math.floor(Date.now() / 1000);
-      let accepted = 0;
-      const invalid = [];
-      for (const ann of plots) {
-        try {
-          if (selfHost && originUrl && new (require('url').URL)(originUrl).hostname === selfHost) continue;
-        } catch {}
-        const check = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
-        if (!check.ok) { invalid.push(ann.plot_id || null); continue; }
-        this.db.prepare('INSERT OR IGNORE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-          .run(String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root), parseFloat(ann.size_gb) || 0, originUrl,
-            String(ann.vrf_public_key || ''), String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
-            String(ann.signature || ''), String(ann.public_key || ''), now);
-        accepted++;
-      }
-      if (accepted > 0) log('info', `[P2P] Received ${accepted}/${plots.length} verified plot announcements from ${originUrl || req.ip}`);
-      res.json({ ok: true, accepted, rejected: invalid.length, invalid });
     });
 
     app.get('/api/plots/announced', (req, res) => {
@@ -779,11 +763,17 @@ const validation = await this.chain.validateTxForMempool(tx);
       res.json({ ok: true, peers: this.peers.gossipPeers(20), stats: this.registry.getStats(), chain_id: this.cfg.chainId });
     });
 
-    app.post('/api/challenge/submit', mutationLimiter, (req, res) => {
+    app.post('/api/challenge/submit', mutationLimiter, async (req, res) => {
       const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
+      const mAddr = String(miner).toLowerCase();
+      const knownPlot = this.db.prepare('SELECT 1 FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr)
+        || this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr);
+      if (!knownPlot && this.sync && typeof this.sync.fetchPlotCommitment === 'function') {
+        await this.sync.fetchPlotCommitment(miner, plot_id).catch(() => null);
+      }
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       log('info', `[MINERS] Challenge submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
       res.json(result);
