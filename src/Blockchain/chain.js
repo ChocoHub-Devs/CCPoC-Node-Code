@@ -302,7 +302,8 @@ class Chain {
       }
       const expectedSigner = String(bloco.forger || bloco.miner || '').toLowerCase();
       if (!signerPubKey) {
-        const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE address = ?').get(expectedSigner);
+        const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE address = ?').get(expectedSigner)
+          || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE address = ?').get(expectedSigner);
         if (pkRow && pkRow.public_key_secp256k1) signerPubKey = pkRow.public_key_secp256k1;
       }
       if (!signerPubKey) return { ok: false, motivo: 'forger not registered or no key' };
@@ -355,7 +356,8 @@ class Chain {
         if (!wp.proof_signature) {
           return { ok: false, motivo: 'winner_proof not signed' };
         }
-        const wpPkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(wpMiner);
+        const wpPkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(wpMiner)
+          || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(wpMiner);
         const wpPk = (wpPkRow && wpPkRow.public_key_secp256k1) || bloco.miner_public_key;
         if (!wpPk) {
           return { ok: false, motivo: 'winner_proof miner has no public key' };

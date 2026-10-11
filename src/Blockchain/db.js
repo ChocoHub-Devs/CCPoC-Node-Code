@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const { log } = require('../../config/config');
 
 function safeBigInt(value, def) {
   if (typeof value === 'bigint') return value;
@@ -45,6 +46,17 @@ function initDB(dbPath, cfg) {
     CREATE TABLE IF NOT EXISTS users (
       address TEXT PRIMARY KEY, public_key_secp256k1 TEXT UNIQUE,
       balance TEXT DEFAULT '0', nonce INTEGER DEFAULT 0,
+      created_at INTEGER, updated_at INTEGER
+    );
+
+    -- Metadados de registo (public key por endereço). ESTA TABELA NAO FAZ PARTE
+    -- DO STATE_ROOT: o estado de consenso e apenas users(balance, nonce).
+    -- Antes as APIs de registo de wallet/plot criavam linhas em users com
+    -- balance=0, o que alterava o state_root de cada node conforme as chamadas
+    -- de API que fez localmente — e a rede rejeitava os blocos com
+    -- "state_root mismatch" ao sincronizar.
+    CREATE TABLE IF NOT EXISTS user_keys (
+      address TEXT PRIMARY KEY, public_key_secp256k1 TEXT UNIQUE,
       created_at INTEGER, updated_at INTEGER
     );
 
@@ -233,6 +245,21 @@ function initDB(dbPath, cfg) {
   if (!existingTreasury) {
     db.prepare('INSERT OR IGNORE INTO users (address, public_key_secp256k1, balance, nonce, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(treasuryAddress, '', '0', 0, cfg.genesisTimestamp || Math.floor(Date.now() / 1000), cfg.genesisTimestamp || Math.floor(Date.now() / 1000));
   }
+
+  // Migracao: as public keys passam de users para user_keys, para que os registos
+  // de wallet/plot deixem de escrever em users (estado de consenso). Sem isto,
+  // cada node tinha um state_root diferente consoante as chamadas de API que fez.
+  try {
+    const keyed = db.prepare("SELECT address, public_key_secp256k1, created_at, updated_at FROM users WHERE public_key_secp256k1 IS NOT NULL AND public_key_secp256k1 != ''").all();
+    const insKey = db.prepare('INSERT OR IGNORE INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?,?,?,?)');
+    for (const k of keyed) insKey.run(String(k.address).toLowerCase(), k.public_key_secp256k1, k.created_at || 0, k.updated_at || 0);
+    // Limpar contas fantasma: balance 0 e nonce 0 e sem saldo = nunca foram
+    // criadas pela consenso (nem genesis/tesouro, que fica preservado).
+    const phantom = db.prepare("SELECT address FROM users WHERE balance = '0' AND (nonce IS NULL OR nonce = 0) AND address != ?").all(treasuryAddress);
+    const delUser = db.prepare('DELETE FROM users WHERE address = ?');
+    for (const p of phantom) delUser.run(p.address);
+    if (keyed.length || phantom.length) log('info', `[DB] user_keys: ${keyed.length} public keys migradas, ${phantom.length} contas fora-da-consenso removidas de users`);
+  } catch (e) { log('warn', `[DB] migracao user_keys falhou: ${e.message}`); }
 
   try {
     db.prepare(`

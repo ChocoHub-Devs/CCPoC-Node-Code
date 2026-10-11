@@ -92,7 +92,8 @@ class ChallengeManager {
 
     const proofSig = (proofPacket && proofPacket.proof_signature) || '';
     if (!proofSig) return { ok: false, motivo: 'proof_signature required' };
-    const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(miner);
+    const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(miner)
+      || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(miner);
     if (!pkRow || !pkRow.public_key_secp256k1) return { ok: false, motivo: 'miner has no registered public key' };
     const msg = proofMessage(challengeId, miner, deadline, plotId);
     if (!verifySignature(msg, proofSig, pkRow.public_key_secp256k1)) {
