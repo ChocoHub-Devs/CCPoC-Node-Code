@@ -345,7 +345,6 @@ class Chain {
           finalized_at: 1,
         };
         if (!challenge.finalized_at || !challenge.winner_miner || safeInt(challenge.winner_deadline, -1) < 0) return { ok: false, motivo: 'challenge has no finalized winner' };
-        if (normalizeAddr(challenge.winner_miner) !== normalizeAddr(bloco.miner || '')) return { ok: false, motivo: 'block miner is not challenge winner' };
         const expectedChallengeId = sha256hex(`${String(challenge.challenge_seed || '')}:${String(parent.hash)}`);
         if (String(bloco.challenge_id) !== expectedChallengeId) return { ok: false, motivo: 'challenge is not bound to parent' };
         if (safeInt(challenge.block_height, -1) !== parent.height) return { ok: false, motivo: 'challenge height does not match parent' };
@@ -363,13 +362,14 @@ class Chain {
           return { ok: false, motivo: 'winner_proof has no deadline' };
         }
         // O timestamp tem de respeitar o deadline ALEGADO na prova (recomputado
-        // criptograficamente mais abaixo), não o melhor deadline que este node
-        // observou: o mesmo miner pode submeter provas de plots diferentes a
-        // nodes diferentes, e cada node finaliza com o melhor que viu. Exigir
-        // igualdade com o registo local bifurcava a rede em forks
-        // irreconciliáveis; a legitimidade vem da assinatura, do scoop alvo,
-        // da merkle proof e do deadline recomputado.
-        if (safeInt(bloco.timestamp, 0) < safeInt(challenge.created_at, 0) + wpDeadline) return { ok: false, motivo: 'block timestamp precedes winning deadline' };
+        // criptograficamente mais abaixo), medido a partir do timestamp do
+        // PARENT — o único relógio em que todos os nodes concordam. O
+        // challenge.created_at é a hora local a que ESTE node viu a ponta
+        // (sempre posterior para quem sincroniza atrasado) e usá-lo aqui
+        // rejeitava blocos válidos. O mesmo miner pode ainda submeter plots
+        // diferentes a nodes diferentes; a legitimidade vem da assinatura,
+        // do scoop alvo, da merkle proof e do deadline recomputado.
+        if (safeInt(bloco.timestamp, 0) < safeInt(parent.timestamp, 0) + wpDeadline) return { ok: false, motivo: 'block timestamp precedes winning deadline' };
         if (!wp.proof_signature) {
           return { ok: false, motivo: 'winner_proof not signed' };
         }
