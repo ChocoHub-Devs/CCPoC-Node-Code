@@ -23,7 +23,7 @@ function formatCcAmount(units) {
 
 const rateLimitStore = new Map();
 function rateLimit(options = {}) {
-  const { windowMs = 60000, max = 100, keyPrefix = 'rl', message = 'Too many requests' } = options;
+  const { windowMs = 600000, max = 100, keyPrefix = 'rl', message = 'Too many requests' } = options;
   return (req, res, next) => {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
     const key = `${keyPrefix}:${ip}`;
@@ -392,7 +392,7 @@ app.get('/api/state', (req, res) => {
       const normalizedAddress = address.toLowerCase();
       try { if (pubkeyToAddress(public_key).toLowerCase() !== normalizedAddress) return res.status(400).json({ error: 'address does not match public key' }); } catch { return res.status(400).json({ error: 'Invalid public key' }); }
       const now = Math.floor(Date.now() / 1000);
-      this.db.prepare('INSERT INTO users (address, public_key_secp256k1, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_secp256k1 = excluded.public_key_secp256k1, updated_at = excluded.updated_at').run(normalizedAddress, public_key, now, now);
+      this.db.prepare('INSERT INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(address) DO UPDATE SET public_key_secp256k1 = excluded.public_key_secp256k1, updated_at = excluded.updated_at').run(normalizedAddress, public_key, now, now);
       log('info', `Imported wallet: address=${normalizedAddress}, public_key=${public_key}`);
       res.json({ ok: true, address: normalizedAddress });
     });
@@ -403,14 +403,14 @@ app.get('/api/state', (req, res) => {
       const normalizedAddress = address.toLowerCase();
       try { if (pubkeyToAddress(public_key).toLowerCase() !== normalizedAddress) return res.status(400).json({ error: 'address does not match public key' }); } catch { return res.status(400).json({ error: 'Invalid public key' }); }
       const now = Math.floor(Date.now() / 1000);
-      const existing = this.db.prepare('SELECT address, public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(normalizedAddress);
+      const existing = this.db.prepare('SELECT address, public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(normalizedAddress);
       if (existing && existing.public_key_secp256k1) {
         return res.status(409).json({ ok: false, error: 'public key already registered', address: normalizedAddress });
       }
       if (existing) {
-        this.db.prepare('UPDATE users SET public_key_secp256k1 = ?, updated_at = ? WHERE lower(address) = lower(?)').run(public_key, now, normalizedAddress);
+        this.db.prepare('UPDATE user_keys SET public_key_secp256k1 = ?, updated_at = ? WHERE lower(address) = lower(?)').run(public_key, now, normalizedAddress);
       } else {
-        this.db.prepare('INSERT INTO users (address, public_key_secp256k1, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?)').run(normalizedAddress, public_key, now, now);
+        this.db.prepare('INSERT INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?, ?, ?, ?)').run(normalizedAddress, public_key, now, now);
       }
       log('info', `Registered wallet: address=${normalizedAddress}, public_key=${public_key}`);
       res.json({ ok: true, address: normalizedAddress, public_key });
@@ -522,11 +522,11 @@ app.get('/api/state', (req, res) => {
       const now = Math.floor(Date.now() / 1000);
       this.db.prepare('INSERT OR REPLACE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, vrf_verified, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
         .run(plot_id, normalizedAddress, merkle_root, parsedSize, safeInt(total_scoops, 0), vrfPublicKey, vrfOutput, JSON.stringify(vrfProof || ''), vrfVerified, now);
-      const existingUser = this.db.prepare('SELECT address FROM users WHERE lower(address) = lower(?)').get(normalizedAddress);
+      const existingUser = this.db.prepare('SELECT address FROM user_keys WHERE lower(address) = lower(?)').get(normalizedAddress);
       if (!existingUser) {
-        this.db.prepare('INSERT INTO users (address, public_key_secp256k1, balance, nonce, created_at, updated_at) VALUES (?, ?, 0, 0, ?, ?)').run(normalizedAddress, public_key, now, now);
+        this.db.prepare('INSERT INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?, ?, ?, ?)').run(normalizedAddress, public_key, now, now);
       } else {
-        this.db.prepare('UPDATE users SET public_key_secp256k1 = ?, updated_at = ? WHERE lower(address) = lower(?)').run(public_key, now, normalizedAddress);
+        this.db.prepare('UPDATE user_keys SET public_key_secp256k1 = ?, updated_at = ? WHERE lower(address) = lower(?)').run(public_key, now, normalizedAddress);
       }
       log('info', `[MINERS] Plot registered (signed, VRF=${vrfVerified ? 'verified' : 'none'}): miner=${normalizedAddress}, plot_id=${plot_id}, size_gb=${size_gb}, merkle_root=${merkle_root}`);
       res.json({ ok: true, plot_id, miner: normalizedAddress, vrf_verified: vrfVerified === 1 });
