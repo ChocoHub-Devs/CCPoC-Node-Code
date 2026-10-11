@@ -55,7 +55,7 @@ function loadConfig() {
     genesisTimestamp: 1735689600,
     maxFutureBlockSec: 120,
     difficultyAdjustBlocks: 8192,
-    expectedTimePerBlock: 60,
+    expectedTimePerBlock: 120,
     genesisBaseTarget: 2 ** 40,
     btDriftTolerance: 2,
     baseTargetMin: 2 ** 32,
