@@ -38,7 +38,7 @@ function loadConfig() {
     syncIntervalMs: 1000,
     heartbeatMs: 20000,
     discoveryMs: 30000,
-    blockTimeTarget: 60,
+    blockTimeTarget: 120,
     minerAddress: '',
     minerPrivateKey: '',
     minerPublicKey: '',
