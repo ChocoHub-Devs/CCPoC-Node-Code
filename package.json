@@ -3,14 +3,15 @@
   "version": "3.6.0",
   "private": true,
   "engines": {
-  "node": "22.x"
+    "node": "22.x"
   },
   "bin": {
     "choco": "./chocohub.js"
   },
   "scripts": {
     "start": "node chocohub.js",
-    "cli": "node cli.js"
+    "cli": "node cli.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@ethereumjs/block": "^10.1.2",
