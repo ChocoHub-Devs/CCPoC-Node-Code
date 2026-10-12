@@ -1,6 +1,34 @@
 Hello CC miner! Lets get straight to the point:
 
-1. Dependencies:
+## 1. Dependencies & Requirements:
+
+## Requirements:
+
+| Item | Details |
+|---|---|
+| **Node.js** | **22.x** [Download](https://nodejs.org/en/download) |
+| **A public URL** | Other nodes must be able to reach yours. Use **port forwarding** (best option) or a tunnel such as [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) (or ngrok). |
+| **A CCPoC wallet** | An `0x...` address and its private key. |
+| **Hardware** | See [Hardware](#hardware) below. |
+ 
+### Hardware
+ 
+The node is **I/O bound**, so it barely uses your hardware.
+ 
+| | Without smart contracts | With smart contracts |
+|---|---|---|
+| **CPU** | Any modest office CPU or basic laptop CPU is enough. | A stronger, dedicated CPU with spare threads. |
+| **RAM** | 4 GB total (the node itself uses ~60 MB; keep 1-2 GB free as headroom). | 4 GB or more, since the EVM need extra memory. |
+| **Network** | At least **2 MB/s** (≈ 16 Mbps). Blocks are capped at 2 MB. | Same. |
+ 
+**Storage**
+ 
+| Node type | Minimum | Notes |
+|---|---|---|
+| **Light node** | 32 GB | Keeps the last 8192 blocks. At the 2 MB block cap that is ~16 GB, so leave room to spare. |
+| **Full node** | 1 TB | Even though the chain is small today, it will grow. |
+
+## Dependencies:
 
 Firstly, for running a node, make sure you have node js installed on your pc;
 > Dont have it installed? Download here -> https://nodejs.org/en/download
@@ -72,5 +100,12 @@ SMART_CONTRACTS_ENABLED=true
 
 Firstly, run: "npm install" for downloading all node modules and dependencies, may take some time!
 then run: "npm start" or "node chocohub.js"
+
+### Windows note
+ 
+The node uses `better-sqlite3`, If `npm install` fails on Windows, install the
+[Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (C++ workload) and Python, then try again.
+ 
+---
 
 and here we are, you are running a node!
