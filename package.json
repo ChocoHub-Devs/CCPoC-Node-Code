@@ -3,7 +3,7 @@
   "version": "3.6.0",
   "private": true,
   "engines": {
-    "node": "22.x"
+  "node": "22.x"
   },
   "bin": {
     "choco": "./chocohub.js"
