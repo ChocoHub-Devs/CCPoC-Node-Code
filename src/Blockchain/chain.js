@@ -5,6 +5,7 @@ const { ZkpService } = require('../crypto-utils/zkp-service');
 const { SnapSyncService } = require('../snap/snap-service');
 const { hashBlockAsync, verifySignatureAsync } = require('../utils/worker-pool');
 const { estimateIntrinsicGas, nextBaseFee, GAS_PARAMS, capTxGasLimit, minimumFee } = require('../consensus/gas');
+const { isWithinRatio } = require('../consensus/base-target-validation');
 const { log } = require('../../config/config');
 const { createBlock } = require('@ethereumjs/block');
 const { bytesToHex } = require('@ethereumjs/util');
@@ -289,12 +290,9 @@ class Chain {
       let blockBaseTarget;
       try { blockBaseTarget = BigInt(bloco.base_target); } catch { return { ok: false, motivo: 'invalid base_target format' }; }
       if (expectedBaseTarget > 0n && blockBaseTarget > 0n) {
-        const ratio = blockBaseTarget > expectedBaseTarget
-          ? blockBaseTarget / expectedBaseTarget
-          : expectedBaseTarget / blockBaseTarget;
         const maxRatio = BigInt(Math.max(1, safeInt(this.cfg.btDriftTolerance, 2)));
-        if (ratio > maxRatio) {
-          log('warn', `base_target drift at #${height}: got ${blockBaseTarget}, expected ${expectedBaseTarget} (${Number(ratio)}x > ${maxRatio}x)`);
+        if (!isWithinRatio(blockBaseTarget, expectedBaseTarget, maxRatio)) {
+          log('warn', `base_target drift at #${height}: got ${blockBaseTarget}, expected ${expectedBaseTarget} (allowed ratio: ${maxRatio}x)`);
           return { ok: false, motivo: `incorrect base_target: got ${blockBaseTarget}, expected ${expectedBaseTarget}` };
         }
       }
@@ -442,10 +440,9 @@ class Chain {
         if (wpBaseTarget > 0n && /^\d+$/.test(challengeBt)) {
           const expectedChallengeBt = BigInt(challengeBt);
           if (expectedChallengeBt > 0n) {
-            const ratio = wpBaseTarget > expectedChallengeBt ? wpBaseTarget / expectedChallengeBt : expectedChallengeBt / wpBaseTarget;
             const maxRatio = BigInt(Math.max(1, safeInt(this.cfg.btDriftTolerance, 2)));
-            if (ratio > maxRatio) {
-              return { ok: false, motivo: `winner_proof base_target drift (${Number(ratio)}x > ${maxRatio}x)` };
+            if (!isWithinRatio(wpBaseTarget, expectedChallengeBt, maxRatio)) {
+              return { ok: false, motivo: `winner_proof base_target drift (allowed ratio: ${maxRatio}x)` };
             }
           }
         }
