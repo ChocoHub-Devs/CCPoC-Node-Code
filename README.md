@@ -103,7 +103,7 @@ wheter node will have smart contracts enabled or not, enabled requires better ha
 e.g.:
 SMART_CONTRACTS_ENABLED=true
 
-3. Running a node:
+### 3. Running a node:
 
 Firstly, run: "npm install" for downloading all node modules and dependencies, may take some time!
 then run: "npm start" or "node chocohub.js"
