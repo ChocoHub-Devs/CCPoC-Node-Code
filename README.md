@@ -43,7 +43,7 @@ Firstly, for running a node, make sure you have node js installed on your pc;
 Make sure to have cloudflared tunnel installed too! (or ngrok, but port fowarding is the best option!)
 > Dont have it installed? Download here -> https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/
 
-2. Configurating:
+### 2. Configurating:
 
 Firstly, go to config folder, at the config.env file add your credentials;
 
