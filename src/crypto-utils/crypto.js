@@ -495,121 +495,6 @@ function proofMessage(challengeId, miner, deadline, plotId) {
   }, ['type', 'challenge_id', 'miner', 'deadline', 'plot_id'].sort());
 }
 
-function plotRegisterMessage(miner, plotId, merkleRoot, sizeGb, totalScoops) {
-  return JSON.stringify({
-    type: 'plot_register',
-    miner: String(miner).toLowerCase(),
-    plot_id: String(plotId),
-    merkle_root: String(merkleRoot),
-    size_gb: String(sizeGb),
-    total_scoops: String(totalScoops),
-  }, ['merkle_root', 'miner', 'plot_id', 'size_gb', 'total_scoops', 'type'].sort());
-}
-
-const VRF_H2C_DOMAIN = Buffer.from('CC-VRF-h2c-v2');
-const VRF_SECRET_DOMAIN = Buffer.from('CC-VRF-secret-v1');
-const VRF_C_DOMAIN = Buffer.from('CC-VRF-c-v1');
-const POINT_AT_INFINITY = null;
-
-function vrfHashToCurve(merkleRootHex) {
-  const raw = stripHex(String(merkleRootHex));
-  const input = Buffer.from(raw, 'hex');
-  for (let i = 0; i < 4096; i++) {
-    const x = crypto.createHash('sha256').update(Buffer.concat([VRF_H2C_DOMAIN, input, Buffer.from(String(i))])).digest();
-    try {
-      const pt = secp256k1.ProjectivePoint.fromHex(Buffer.concat([Buffer.from([0x02]), x]));
-      if (pt.equals(secp256k1.ProjectivePoint.ZERO)) continue;
-      return pt;
-    } catch { /* x not a valid field element / curve point, increment */ }
-  }
-  throw new Error('vrfHashToCurve: failed to hash merkle_root to a curve point');
-}
-
-function vrfDerivePlotSecret(minerPrivateKeyHex, plotId, merkleRootHex) {
-  const pk = Buffer.from(stripHex(String(minerPrivateKeyHex)), 'hex');
-  if (pk.length !== 32) throw new Error('Invalid private key length');
-  const seed = Buffer.concat([
-    VRF_SECRET_DOMAIN,
-    pk,
-    Buffer.from(String(plotId || ''), 'utf8'),
-    Buffer.from(stripHex(String(merkleRootHex)), 'hex'),
-  ]);
-  const digest = crypto.createHash('sha256').update(seed).digest();
-  const idx = BigInt('0x' + digest.toString('hex'));
-  const n = secp256k1.CURVE.n;
-  let x = idx % n;
-  if (x === 0n) x = 1n;
-  return x;
-}
-
-function vrfProve(minerPrivateKeyHex, plotId, merkleRootHex) {
-  const x = vrfDerivePlotSecret(minerPrivateKeyHex, plotId, merkleRootHex);
-  const G = secp256k1.ProjectivePoint.BASE;
-  const H = vrfHashToCurve(merkleRootHex);
-  const n = secp256k1.CURVE.n;
-  const Y = G.multiply(x);
-  const gamma = H.multiply(x);
-  const output = crypto.createHash('sha256').update(gamma.toRawBytes(true)).digest('hex');
-
-  let c = 0n;
-  let s = 0n;
-  let U, V;
-  for (let attempt = 0; attempt < 64; attempt++) {
-    const k = BigInt('0x' + crypto.randomBytes(32).toString('hex')) % n;
-    U = G.multiply(k);
-    V = H.multiply(k);
-    const challenge = crypto.createHash('sha256').update(Buffer.concat([
-      VRF_C_DOMAIN, G.toRawBytes(true), Y.toRawBytes(true),
-      H.toRawBytes(true), gamma.toRawBytes(true),
-      U.toRawBytes(true), V.toRawBytes(true),
-    ])).digest('hex');
-    c = BigInt('0x' + challenge) % n;
-    s = (k + c * x) % n;
-    if (s !== 0n) break;
-  }
-
-  return {
-    public_key: Buffer.from(Y.toRawBytes(true)).toString('base64'),
-    output,
-    proof: {
-      gamma: Buffer.from(gamma.toRawBytes(true)).toString('base64'),
-      c: c.toString(16),
-      s: s.toString(16),
-    },
-  };
-}
-
-function vrfVerify(publicKeyB64, merkleRootHex, outputHex, proof) {
-  try {
-    if (!proof || typeof proof !== 'object') return false;
-    const G = secp256k1.ProjectivePoint.BASE;
-    const n = secp256k1.CURVE.n;
-    const Y = secp256k1.ProjectivePoint.fromHex(Buffer.from(String(publicKeyB64), 'base64'));
-    if (Y.equals(secp256k1.ProjectivePoint.ZERO)) return false;
-    const H = vrfHashToCurve(merkleRootHex);
-    const gamma = secp256k1.ProjectivePoint.fromHex(Buffer.from(String(proof.gamma), 'base64'));
-    if (gamma.equals(secp256k1.ProjectivePoint.ZERO)) return false;
-
-    const outputCheck = crypto.createHash('sha256').update(gamma.toRawBytes(true)).digest('hex');
-    if (outputCheck !== stripHex(String(outputHex))) return false;
-
-    const c = BigInt.asUintN(256, BigInt('0x' + String(proof.c)));
-    const s = BigInt.asUintN(256, BigInt('0x' + String(proof.s)));
-    if (c >= n || s >= n) return false;
-
-    const U = G.multiply(s).subtract(Y.multiply(c));
-    const V = H.multiply(s).subtract(gamma.multiply(c));
-
-    const challenge = crypto.createHash('sha256').update(Buffer.concat([
-      VRF_C_DOMAIN, G.toRawBytes(true), Y.toRawBytes(true),
-      H.toRawBytes(true), gamma.toRawBytes(true),
-      U.toRawBytes(true), V.toRawBytes(true),
-    ])).digest('hex');
-    const cPrime = BigInt('0x' + challenge) % n;
-    return cPrime === c;
-  } catch { return false; }
-}
-
 function hashBlock(bloco) {
   let rewardsStr = '';
   if (Array.isArray(bloco.rewards)) {
@@ -645,6 +530,19 @@ function hashBlock(bloco) {
     state_root: bloco.state_root || '',
     winner_proof: winnerProofStr,
   };
+  if (Number(bloco.height) === 0) {
+    const genesisPlots = Array.isArray(bloco.genesis_plot_registrations)
+      ? bloco.genesis_plot_registrations.map((plot) => ({
+        capacity_bytes: String(plot.capacity_bytes),
+        merkle_root: String(plot.merkle_root).toLowerCase(),
+        miner: String(plot.miner).toLowerCase(),
+        plot_id: String(plot.plot_id).toLowerCase(),
+      })).sort((a, b) => a.plot_id.localeCompare(b.plot_id))
+      : [];
+    d.consensus_version = 4;
+    d.chain_id = String(bloco.chain_id ?? '');
+    d.genesis_plot_registrations = JSON.stringify(genesisPlots);
+  }
   return sha256hex(JSON.stringify(d, Object.keys(d).sort()));
 }
 
@@ -718,10 +616,7 @@ function isBetterChainCandidate(candidate, incumbent) {
   return String((candidate || {}).hash || '') < String((incumbent || {}).hash || '');
 }
 
-const SCOOP_SIZE = 32;
 const SCOOPS_PER_NONCE = 8192;
-const MINING_SCOOP_MODULUS = 4096;
-const PLOT_FORMAT_V3 = 3;
 
 function merkleTreeInternalNodeCount(N) {
   let total = 0;
@@ -732,8 +627,6 @@ function merkleTreeInternalNodeCount(N) {
   return total;
 }
 
-function plotScoopCount(sizeGb) { return Math.max(1, Math.floor((sizeGb * 1024 * 1024 * 1024) / SCOOP_SIZE)); }
-function plotScoopCountOrig(sizeGb) { return plotScoopCount(sizeGb); }
 
 function computeDeadline(scoopData, genSig, baseTarget) {
   if (baseTarget == null || baseTarget === '' || BigInt(baseTarget) <= 0n) {
@@ -782,9 +675,8 @@ module.exports = {
   pubkeyToAddress, pubKeyToAddress, signMessage, verifySignature,
   evmTxDigest, evmTxHash, signTransactionTx, recoverTransactionSender, signatureToHex, signatureFromHex,
   merkleRoot, merkleRootBuffer, merkleRootBuf, merkleRootBuf2, computeMerkleProof, computeMerkleProofBuf, computeMerkleProofBuf2, computeMerkleTreeNodes, verifyMerkleProof, verifyMerkleProofBuf, expectedMerkleProofLen,
-  canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage, plotRegisterMessage,
+  canonicalTxMessage, hashTransaction, hashBlock, blockMessage, proofMessage,
   computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, calculateMiningReward, isBetterChainCandidate,
-  SCOOP_SIZE, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, PLOT_FORMAT_V3, merkleTreeInternalNodeCount, plotScoopCount, plotScoopCountOrig,
+  SCOOPS_PER_NONCE, merkleTreeInternalNodeCount,
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
-  vrfHashToCurve, vrfDerivePlotSecret, vrfProve, vrfVerify,
 };

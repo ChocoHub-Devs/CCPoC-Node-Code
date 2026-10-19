@@ -86,17 +86,6 @@ function initDB(dbPath, cfg) {
     CREATE INDEX IF NOT EXISTS idx_sub_challenge ON challenge_submissions(challenge_id);
     CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline);
 
-    CREATE TABLE IF NOT EXISTS plot_commitments (
-      plot_id TEXT, miner TEXT, merkle_root TEXT, size_gb REAL,
-      created_at INTEGER, public_key TEXT DEFAULT '', signature TEXT DEFAULT '',
-      PRIMARY KEY(plot_id, miner)
-    );
-
-    CREATE TABLE IF NOT EXISTS peer_plot_commitments (
-      plot_id TEXT, miner TEXT, size_gb REAL, node_url TEXT,
-      created_at INTEGER, total_scoops INTEGER DEFAULT 0, PRIMARY KEY(plot_id, miner, node_url)
-    );
-
     CREATE TABLE IF NOT EXISTS block_rewards (
       block_height INTEGER, block_hash TEXT, challenge_id TEXT,
       miner TEXT, plot_id TEXT, size_gb REAL, reward_cc TEXT, 
@@ -113,10 +102,20 @@ function initDB(dbPath, cfg) {
     CREATE INDEX IF NOT EXISTS idx_block_payouts_height ON block_payouts(height);
     CREATE INDEX IF NOT EXISTS idx_block_payouts_to ON block_payouts(to_addr);
 
-    CREATE TABLE IF NOT EXISTS plot_cache (
-      plot_id TEXT PRIMARY KEY, merkle_root TEXT, size_gb REAL,
-      updated_at INTEGER
+    CREATE TABLE IF NOT EXISTS plot_registration_events (
+      block_hash TEXT NOT NULL,
+      block_height INTEGER NOT NULL,
+      miner TEXT NOT NULL,
+      plot_id TEXT NOT NULL,
+      merkle_root TEXT NOT NULL,
+      capacity_bytes TEXT NOT NULL,
+      tx_hash TEXT NOT NULL,
+      PRIMARY KEY (block_hash, plot_id, miner),
+      UNIQUE (block_hash, tx_hash),
+      FOREIGN KEY (block_hash) REFERENCES blocks(hash) ON DELETE CASCADE
     );
+    CREATE INDEX IF NOT EXISTS idx_plot_registration_owner ON plot_registration_events(miner, plot_id);
+    CREATE INDEX IF NOT EXISTS idx_plot_registration_height ON plot_registration_events(block_height);
 
     CREATE TABLE IF NOT EXISTS config (
       key TEXT PRIMARY KEY, value TEXT
@@ -200,20 +199,6 @@ function initDB(dbPath, cfg) {
   try { db.prepare("ALTER TABLE blocks ADD COLUMN miner_public_key TEXT DEFAULT ''").run(); } catch {}
   try { db.prepare('ALTER TABLE mining_challenges ADD COLUMN base_target TEXT').run(); } catch {}
   try { db.prepare("ALTER TABLE blocks ADD COLUMN rewards_json TEXT DEFAULT '[]'").run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN total_scoops INTEGER DEFAULT 0').run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_public_key TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_output TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_proof TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN vrf_verified INTEGER DEFAULT 0').run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE plot_commitments ADD COLUMN signature TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN merkle_root TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_public_key TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_output TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN vrf_proof TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN signature TEXT DEFAULT ""').run(); } catch {}
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch {};
-  try { db.prepare('ALTER TABLE peer_plot_commitments ADD COLUMN total_scoops INTEGER DEFAULT 0').run(); } catch {}
   try { db.prepare("ALTER TABLE transactions ADD COLUMN chain_id TEXT DEFAULT ''").run(); } catch {}
 
   const chainIdDefault = String(cfg.chainId || '0');

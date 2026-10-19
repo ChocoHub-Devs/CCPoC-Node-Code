@@ -1,6 +1,7 @@
 const crypto = require('crypto');
-const { ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRootAfterTxs, calculateMiningReward, verifyMerkleProofBuf, computeDeadline, plotScoopCount, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, verifySignature, canonicalTxMessage, proofMessage, recoverTransactionSender } = require('../crypto-utils/crypto');
+const { ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRootAfterTxs, calculateMiningReward, computeDeadline, verifySignature, pubkeyToAddress, canonicalTxMessage, proofMessage, recoverTransactionSender } = require('../crypto-utils/crypto');
 const { log } = require('../../config/config');
+const PocPlotV4 = require('../consensus/poc-plot-v4');
 
 
 class ChallengeManager {
@@ -18,11 +19,15 @@ class ChallengeManager {
     const genSig = (tip && tip.generation_signature) || ZERO_HASH;
     const tipHash = tip ? tip.hash : ZERO_HASH;
     const challengeId = sha256hex(`${genSig}:${tipHash}`);
-    const targetIdx = parseInt(sha256hex(genSig).slice(0, 8), 16) % MINING_SCOOP_MODULUS;
+    const targetIdx = PocPlotV4.challengeTargetSlot(challengeId);
     const challengeGrace = Math.max(15, Math.floor((this.cfg.expectedTimePerBlock || 60) / 2));
     const challengeExpiredGraceSec = Math.max(this.cfg.challengeExpiredGraceSec || 300, (this.cfg.expectedTimePerBlock || 60) * 2);
     const baseTarget = this.chain._baseTargetForHeight(this.chain.height);
-    const withBt = (r) => (r ? { ...r, base_target: (r && r.base_target) || String(baseTarget) } : r);
+    const withBt = (r) => (r ? {
+      ...r,
+      target_scoop_index: targetIdx,
+      base_target: (r && r.base_target) || String(baseTarget),
+    } : r);
 
     const pendingWinner = this.db.prepare(`SELECT * FROM mining_challenges WHERE challenge_id = ? AND forged_block_height IS NULL
       AND winner_miner IS NOT NULL AND winner_deadline IS NOT NULL AND finalized_at IS NOT NULL
@@ -64,46 +69,47 @@ class ChallengeManager {
     const maxDl = chain.computeMaxDeadline();
     deadline = safeInt(deadline, -1);
     if (deadline < 0 || deadline > maxDl) return { ok: false, motivo: `invalid deadline (must be 0–${maxDl}s)` };
-    const plot = this.db.prepare('SELECT * FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plotId, miner);
-    const peerPlot = this.db.prepare('SELECT * FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plotId, miner);
-    const commitment = plot || peerPlot;
-    const sizeGb = commitment ? (Number(commitment.size_gb) || 1) : 1;
-    const committedRoot = (commitment && commitment.merkle_root) || '';
+    const challengeHeight = safeInt(ch.block_height, this.chain.height);
+    const parent = this.chain.getBlock(challengeHeight);
+    const commitment = parent && this.chain.getPlotRegistration(plotId, miner, parent.hash, Math.max(0, challengeHeight - 1));
+    if (!commitment) return { ok: false, motivo: 'plot has no mature consensus registration for this challenge' };
+    const sizeGb = Number(BigInt(commitment.capacity_bytes)) / (1024 ** 3);
+    const committedRoot = commitment.merkle_root;
     if (!proofPacket || !proofPacket.scoop_data) return { ok: false, motivo: 'proof_packet with scoop_data required for PoC verification' };
     if (!committedRoot) return { ok: false, motivo: 'plot has no merkle_root commitment' };
     const genSig = ch.challenge_seed || ZERO_HASH;
     const networkBaseTarget = ch.base_target || chain._baseTargetForHeight(ch.block_height || chain.height);
-    const computedDeadline = Math.min(computeDeadline(proofPacket.scoop_data, genSig, networkBaseTarget), maxDl);
+    const computedDeadline = computeDeadline(proofPacket.scoop_data, genSig, networkBaseTarget);
+    if (computedDeadline > maxDl) return { ok: false, motivo: `computed deadline exceeds network limit (${computedDeadline} > ${maxDl}s)` };
     if (computedDeadline !== deadline) return { ok: false, motivo: `PoC verification failed: computed ${computedDeadline}s, submitted ${deadline}s` };
     const expectedDigest = sha256hex(Buffer.concat([Buffer.from(proofPacket.scoop_data, 'hex'), Buffer.from(String(computedDeadline))]));
     if (proofPacket.proof_digest && proofPacket.proof_digest !== expectedDigest) return { ok: false, motivo: 'proof digest mismatch' };
-    const totalScoops = safeInt(proofPacket.total_scoops, 0) || plotScoopCount(sizeGb);
+    const totalScoops = safeInt(proofPacket.total_scoops, 0);
     const scoopIndex = safeInt(proofPacket.scoop_index, -1);
     if (scoopIndex < 0 || scoopIndex >= totalScoops) return { ok: false, motivo: `invalid scoop_index ${scoopIndex} for ${totalScoops} scoops` };
-    const expectedTargetIdx = ch.target_scoop_index != null
-      ? safeInt(ch.target_scoop_index, -1)
-      : parseInt(sha256hex(genSig).slice(0, 8), 16) % MINING_SCOOP_MODULUS;
-    if (scoopIndex % MINING_SCOOP_MODULUS !== expectedTargetIdx) {
-      return { ok: false, motivo: `scoop_index ${scoopIndex} is not the challenge target scoop (expected mod ${MINING_SCOOP_MODULUS} == ${expectedTargetIdx})` };
-    }
     const merkleProof = proofPacket.merkle_proof || [];
-    const leafHash = Buffer.from(proofPacket.scoop_data, 'hex');
-    if (!verifyMerkleProofBuf(leafHash, scoopIndex, totalScoops, merkleProof, committedRoot)) return { ok: false, motivo: 'Merkle proof does not match committed plot root' };
+    const checked = this.chain.verifyPocV4CapacityProof(
+      { ...proofPacket, total_scoops: totalScoops }, challengeId, miner, plotId,
+      challengeHeight + 1, parent.hash,
+    );
+    if (!checked.ok) return { ok: false, motivo: checked.motivo };
 
     const proofSig = (proofPacket && proofPacket.proof_signature) || '';
     if (!proofSig) return { ok: false, motivo: 'proof_signature required' };
-    const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(miner)
-      || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(miner);
-    if (!pkRow || !pkRow.public_key_secp256k1) return { ok: false, motivo: 'miner has no registered public key' };
+    const proofPublicKey = String(proofPacket.public_key || '');
+    if (!proofPublicKey) return { ok: false, motivo: 'miner public key is required' };
+    try {
+      if (pubkeyToAddress(proofPublicKey).toLowerCase() !== String(miner).toLowerCase()) return { ok: false, motivo: 'proof public key does not match miner address' };
+    } catch { return { ok: false, motivo: 'invalid proof public key' }; }
     const msg = proofMessage(challengeId, miner, deadline, plotId);
-    if (!verifySignature(msg, proofSig, pkRow.public_key_secp256k1)) {
+    if (!verifySignature(msg, proofSig, proofPublicKey)) {
       return { ok: false, motivo: 'proof signature does not match miner address' };
     }
 
     const insertRes = this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at) VALUES (?,?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, proofSig, now);
     if (insertRes.changes > 0 && /^[0-9a-fA-F]{64}$/.test(proofPacket.scoop_data)) {
-      this.db.prepare('UPDATE challenge_submissions SET scoop_data = ?, scoop_index = ?, total_scoops = ?, merkle_proof = ?, merkle_root = ? WHERE challenge_id = ? AND miner = ? AND plot_id = ? AND deadline = ?')
-        .run(String(proofPacket.scoop_data), safeInt(proofPacket.scoop_index, 0), safeInt(proofPacket.total_scoops, 0), JSON.stringify(merkleProof || []), String(committedRoot || ''), challengeId, miner, plotId, deadline);
+      this.db.prepare('UPDATE challenge_submissions SET scoop_data = ?, scoop_index = ?, total_scoops = ?, merkle_proof = ?, merkle_root = ?, capacity_samples = ?, public_key = ? WHERE challenge_id = ? AND miner = ? AND plot_id = ? AND deadline = ?')
+        .run(String(proofPacket.scoop_data), safeInt(proofPacket.scoop_index, 0), totalScoops, JSON.stringify(merkleProof || []), String(committedRoot || ''), JSON.stringify(proofPacket.capacity_samples || []), proofPublicKey, challengeId, miner, plotId, deadline);
     }
     const updated = this.db.prepare('UPDATE mining_challenges SET winner_miner = ?, winner_deadline = ?, winner_plot_id = ?, finalized_at = ? WHERE challenge_id = ? AND (winner_deadline IS NULL OR ? < winner_deadline)').run(miner, deadline, plotId, now, challengeId, deadline);
     const subCount = this.db.prepare('SELECT COUNT(*) as cnt FROM challenge_submissions WHERE challenge_id = ?').get(challengeId).cnt;
@@ -347,7 +353,7 @@ class ChallengeManager {
       || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(winner.miner);
     const winnerProof = {
       miner: (winner.miner || '').toLowerCase(),
-      public_key: (winnerPkRow && winnerPkRow.public_key_secp256k1) || '',
+      public_key: winner.public_key || (winnerPkRow && winnerPkRow.public_key_secp256k1) || '',
       deadline: winner.deadline,
       plot_id: winner.plot_id || '',
       proof_signature: winner.proof_signature || '',
@@ -356,6 +362,7 @@ class ChallengeManager {
       scoop_index: safeInt(winner.scoop_index, 0),
       total_scoops: safeInt(winner.total_scoops, 0),
       merkle_root: winner.merkle_root || '',
+      capacity_samples: (() => { try { return JSON.parse(String(winner.capacity_samples || '[]')); } catch { return []; } })(),
       challenge_seed: challenge.challenge_seed || '',
       base_target: String(challenge.base_target || this.chain._baseTargetForHeight(safeInt(challenge.block_height, this.chain.height))),
     };

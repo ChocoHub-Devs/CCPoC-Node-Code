@@ -1,9 +1,8 @@
 const path = require('path');
-const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningReward, verifySignature, plotRegisterMessage, evmTxHash, recoverTransactionSender, vrfProve, vrfVerify } = require('../crypto-utils/crypto');
+const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningReward, evmTxHash, recoverTransactionSender } = require('../crypto-utils/crypto');
 const { log, getLogBuffer } = require('../../config/config');
-const MAX_PLOT_GB = require('../crypto-utils/plot-capacity').MAX_PLOT_GB;
-const { makeLocalAnnouncement, verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { estimateIntrinsicGas, minimumFee } = require('../consensus/gas');
+const PocPlotV4 = require('../consensus/poc-plot-v4');
 
 const CC_SCALE = 10n ** 18n;
 function parseCcAmount(value) {
@@ -270,7 +269,12 @@ app.get('/api/state', (req, res) => {
     });
 
     app.get('/api/plots', (req, res) => {
-      const plots = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, created_at FROM plot_commitments ORDER BY size_gb DESC').all();
+      const tip = this.chain.getBlock(this.chain.height);
+      const plots = tip ? this.chain.getMaturePlotRegistrations(tip.hash, this.chain.height + 1).map((p) => ({
+        ...p,
+        size_gb: Number(BigInt(p.capacity_bytes)) / (1024 ** 3),
+        created_at: p.block_height,
+      })) : [];
       res.json({ plots });
     });
 
@@ -279,9 +283,10 @@ app.get('/api/state', (req, res) => {
       if (!ch) return res.status(404).json({ error: 'no active challenge' });
       const now = Math.floor(Date.now() / 1000);
       const deadline = ch.expires_at ? Math.max(0, ch.expires_at - now) : 0;
-      const capacityGbRaw = this.db.prepare('SELECT COALESCE(SUM(size_gb), 0) as s FROM (SELECT DISTINCT plot_id, size_gb FROM plot_commitments)').get().s;
-      const capacityGb = Number(capacityGbRaw) || 0;
-      const plotsCount = this.db.prepare('SELECT COUNT(DISTINCT plot_id) as c FROM plot_commitments').get().c;
+      const tip = this.chain.getBlock(this.chain.height);
+      const registered = tip ? this.chain.getMaturePlotRegistrations(tip.hash, this.chain.height + 1) : [];
+      const capacityGb = Number(registered.reduce((sum, p) => sum + BigInt(p.capacity_bytes), 0n)) / (1024 ** 3);
+      const plotsCount = registered.length;
       res.json({
         challenge_id: ch.challenge_id,
         block_height: ch.block_height,
@@ -357,7 +362,7 @@ app.get('/api/state', (req, res) => {
           sign_message: '0x' + (require('../crypto-utils/crypto').evmTxDigest ? require('../crypto-utils/crypto').evmTxDigest(tx) : ''),
           tx_hash: txHash,
           estimated_gas: intrinsic,
-          estimated_fee: estimatedFee,
+          estimated_fee: String(estimatedFee),
           gas_price: String(currentBaseFee),
           balance: user ? user.balance : '0',
           nonce
@@ -448,12 +453,6 @@ app.get('/api/state', (req, res) => {
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
-      const mAddr = String(miner).toLowerCase();
-      const knownPlot = this.db.prepare('SELECT 1 FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr)
-        || this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr);
-      if (!knownPlot && this.sync && typeof this.sync.fetchPlotCommitment === 'function') {
-        await this.sync.fetchPlotCommitment(miner, plot_id).catch(() => null);
-      }
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       if (!result.ok) return res.status(400).json({ error: result.motivo });
       log('info', `[MINERS] Proof submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
@@ -467,99 +466,32 @@ app.get('/api/state', (req, res) => {
 
     app.get('/api/poc/plots/:miner', (req, res) => {
       const normalizedAddress = String(req.params.miner || '').toLowerCase();
-      res.json({ plots: this.db.prepare('SELECT * FROM plot_commitments WHERE lower(miner) = ?').all(normalizedAddress) });
+      const tip = this.chain.getBlock(this.chain.height);
+      const plots = tip ? this.chain.getMaturePlotRegistrations(tip.hash, this.chain.height + 1).filter((p) => p.miner === normalizedAddress) : [];
+      res.json({ plots });
     });
 
-    // if you are checking this code, you are probably asking yourself why theres 2 register_plots
-    // the reason is that register_plot is a remanant of the old built in miner on node (legacy)
-    // this endpoint does not require the private key signature, while register_plot_public yes.
-    app.post('/api/poc/register_plot', requireAdmin, (req, res) => {
-      const { miner, plot_id, size_gb, merkle_root = '' } = req.body;
-      if (!miner || !plot_id || size_gb == null) return res.status(400).json({ error: 'miner, plot_id, size_gb required' });
-      const normalizedAddress = String(miner).toLowerCase();
-      const parsedSize = parseFloat(size_gb);
-      if (!Number.isFinite(parsedSize) || parsedSize <= 0 || parsedSize > MAX_PLOT_GB) return res.status(400).json({ error: `invalid size_gb (1-${MAX_PLOT_GB} GB)` });
-      console.log(`Registering plot: miner=${normalizedAddress}, plot_id=${plot_id}, size_gb=${parsedSize}, merkle_root=${merkle_root}`);
-      this.db.prepare('INSERT OR IGNORE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, created_at) VALUES (?,?,?,?,?)')
-        .run(plot_id, normalizedAddress, merkle_root, parsedSize, Math.floor(Date.now() / 1000));
-      res.json({ ok: true, plot_id, miner: normalizedAddress });
-    });
-    // the new way to register plots, requires the miner to sign the registration with their private key, so that the node can verify the plot is being registered by the actual miner.
-    app.post('/api/poc/register_plot_public', mutationLimiter, (req, res) => {
-      const { miner, plot_id, merkle_root, size_gb, total_scoops, public_key, signature, vrf } = req.body || {};
-      if (!miner || !plot_id || !merkle_root || size_gb == null || total_scoops == null || !public_key || !signature) {
-        return res.status(400).json({ error: 'miner, plot_id, merkle_root, size_gb, total_scoops, public_key, signature required' });
-      }
-      const normalizedAddress = String(miner).toLowerCase();
-      const parsedSize = parseFloat(String(size_gb));
-      if (!Number.isFinite(parsedSize) || parsedSize <= 0 || parsedSize > MAX_PLOT_GB) {
-        return res.status(400).json({ error: `invalid size_gb (1-${MAX_PLOT_GB} GB)` });
-      }
+    app.post('/api/poc/commitment/encode', mutationLimiter, (req, res) => {
       try {
-        if (pubkeyToAddress(public_key).toLowerCase() !== normalizedAddress) {
-          return res.status(400).json({ error: 'address does not match public key' });
-        }
-        const msg = plotRegisterMessage(normalizedAddress, plot_id, merkle_root, String(size_gb), String(total_scoops));
-        if (!verifySignature(msg, signature, public_key)) {
-          return res.status(401).json({ error: 'invalid registration signature' });
-        }
-      } catch (e) {
-        return res.status(400).json({ error: `invalid public key or signature encoding: ${e.message}` });
-      }
-      let vrfPublicKey = (vrf && vrf.public_key) || '';
-      let vrfOutput = (vrf && vrf.output) || '';
-      let vrfProof = (vrf && vrf.proof) || '';
-      let vrfVerified = 0;
-      const isOwnPlot = this.cfg.minerAddress && normalizedAddress === String(this.cfg.minerAddress).toLowerCase();
-      if (isOwnPlot && this.cfg.minerPrivateKey) {
-        try {
-          const gen = vrfProve(this.cfg.minerPrivateKey, plot_id, merkle_root);
-          vrfPublicKey = gen.public_key;
-          vrfOutput = gen.output;
-          vrfProof = gen.proof;
-          vrfVerified = 1;
-        } catch (e) { log('warn', `[MINERS] VRF generation failed for own plot: ${e.message}`); }
-      } else if (vrfPublicKey && vrfOutput && vrfProof) {
-        try {
-          vrfVerified = vrfVerify(String(vrfPublicKey), merkle_root, String(vrfOutput), vrfProof) ? 1 : 0;
-          if (!vrfVerified) return res.status(400).json({ error: 'invalid VRF capacity commitment' });
-        } catch { return res.status(400).json({ error: 'invalid VRF capacity commitment' }); }
-      }
-      const now = Math.floor(Date.now() / 1000);
-      this.db.prepare('INSERT OR REPLACE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, vrf_verified, public_key, signature, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-        .run(plot_id, normalizedAddress, merkle_root, parsedSize, safeInt(total_scoops, 0), vrfPublicKey, vrfOutput, JSON.stringify(vrfProof || ''), vrfVerified, public_key, signature, now);
-      const existingUser = this.db.prepare('SELECT address FROM user_keys WHERE lower(address) = lower(?)').get(normalizedAddress);
-      if (!existingUser) {
-        this.db.prepare('INSERT INTO user_keys (address, public_key_secp256k1, created_at, updated_at) VALUES (?, ?, ?, ?)').run(normalizedAddress, public_key, now, now);
-      } else {
-        this.db.prepare('UPDATE user_keys SET public_key_secp256k1 = ?, updated_at = ? WHERE lower(address) = lower(?)').run(public_key, now, normalizedAddress);
-      }
-      log('info', `[MINERS] Plot registered (signed, VRF=${vrfVerified ? 'verified' : 'none'}): miner=${normalizedAddress}, plot_id=${plot_id}, size_gb=${size_gb}, merkle_root=${merkle_root}`);
-      res.json({ ok: true, plot_id, miner: normalizedAddress, vrf_verified: vrfVerified === 1 });
-    });
-
-    app.post('/api/poc/verify_plot', mutationLimiter, (req, res) => {
-      const ann = req.body || {};
-      const result = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
-      res.json({ ok: result.ok, verified: result.ok, motivo: result.motivo || null });
-    });
-
-    app.get('/api/plots/announced', (req, res) => {
-      const rows = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops, vrf_public_key, vrf_output, vrf_proof, public_key, signature FROM plot_commitments').all();
-      const plots = [];
-      for (const plot of rows) {
-        if (!plot.merkle_root) continue;
-        let vrfProof = plot.vrf_proof;
-        try { vrfProof = plot.vrf_proof ? JSON.parse(plot.vrf_proof) : ''; } catch {}
-        const ann = makeLocalAnnouncement(plot, this.cfg, {
-          public_key: plot.vrf_public_key || '',
-          output: plot.vrf_output || '',
-          proof: vrfProof,
+        const data = PocPlotV4.encodeRegistration(req.body || {});
+        res.json({
+          ok: true,
+          data,
+          to_addr: PocPlotV4.ZERO_ADDRESS,
+          value: '0',
+          chain_id: String(this.cfg.chainId),
+          note: 'Sign and broadcast as a normal transaction; wait for inclusion and two-block maturity.',
         });
-        plots.push(ann);
+      } catch (e) {
+        res.status(400).json({ error: e.message || 'invalid plot registration' });
       }
-      res.json({ node_url: this.cfg.nodeUrl || '', node_id: this.NODE_ID, plots });
     });
+
+    const removedPlotRegistration = (req, res) => res.status(410).json({ error: 'off-chain plot registration was removed; use genesisPlotRegistrations for the new network bootstrap or submit an on-chain v4 commitment transaction' });
+    app.post('/api/poc/register_plot', requireAdmin, removedPlotRegistration);
+    app.post('/api/poc/register_plot_public', mutationLimiter, removedPlotRegistration);
+    app.post('/api/poc/verify_plot', mutationLimiter, removedPlotRegistration);
+    app.get('/api/plots/announced', removedPlotRegistration);
 
     const contractsEnabled = () => !!this.cfg.smartContractsEnabled && this.smartContracts;
     const contractsDisabled = (res) => res.status(503).json({ error: 'smart contracts disabled on this node', enabled: false });
@@ -765,12 +697,6 @@ const validation = await this.chain.validateTxForMempool(tx);
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
-      const mAddr = String(miner).toLowerCase();
-      const knownPlot = this.db.prepare('SELECT 1 FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr)
-        || this.db.prepare('SELECT 1 FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(plot_id, mAddr);
-      if (!knownPlot && this.sync && typeof this.sync.fetchPlotCommitment === 'function') {
-        await this.sync.fetchPlotCommitment(miner, plot_id).catch(() => null);
-      }
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       log('info', `[MINERS] Challenge submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
       res.json(result);

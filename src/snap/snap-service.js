@@ -92,7 +92,7 @@ class SnapSyncService {
   verifySnapshot(snapshot) {
     const integrity = snap.verifySnapshotIntegrity(snapshot);
     if (!integrity.ok) return { ok: false, motivo: integrity.motivo };
-    return { ok: true, state_root: snapshot.state_root };
+    return { ok: false, motivo: 'SnapSync is disabled for v4: snapshot state is not authenticated against block ancestry' };
   }
 
   applySnapshot(snapshot) {

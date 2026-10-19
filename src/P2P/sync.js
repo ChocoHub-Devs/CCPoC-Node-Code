@@ -1,6 +1,5 @@
 const { URL } = require('url');
 const { safeInt, safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate } = require('../crypto-utils/crypto');
-const { verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
 
@@ -87,85 +86,6 @@ class SyncEngine {
     }));
   }
 
-  async fetchPlotCommitment(miner, plotId) {
-    try {
-      const m = String(miner || '').toLowerCase();
-      const pid = String(plotId || '');
-      if (!m || !pid) return null;
-      const local = this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(pid, m)
-        || this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(pid, m);
-      if (local && local.merkle_root) return local;
-      const selfHost = (() => { try { return this.cfg.nodeUrl ? new (require('url').URL)(this.cfg.nodeUrl).hostname : null; } catch { return null; } })();
-      const targets = [...new Set([...(this.cfg.seedPeers || []), ...this.peers.active(6).map(p => p.url)])]
-        .filter(u => { try { return new (require('url').URL)(u).hostname !== selfHost; } catch { return true; } })
-        .slice(0, 6);
-      if (!targets.length) return null;
-      const paths = [`/api/poc/plots/${m}`, '/api/plots/announced'];
-      const jobs = [];
-      for (const base of targets) {
-        for (const path of paths) {
-          jobs.push(fetchJSON(`${base.replace(/\/+$/, '')}${path}`, { timeout: 6 }).then(data => ({ base, data })).catch(() => null));
-        }
-      }
-      const results = await Promise.allSettled(jobs);
-      for (const r of results) {
-        if (!r || r.status !== 'fulfilled' || !r.value || !r.value.data) continue;
-        const { base, data } = r.value;
-        const cands = Array.isArray(data) ? data : (Array.isArray(data.plots) ? data.plots : []);
-        for (const ann of cands) {
-          if (!ann || String(ann.plot_id) !== pid || String(ann.miner).toLowerCase() !== m) continue;
-          const norm = {
-            miner: m, plot_id: pid,
-            merkle_root: String(ann.merkle_root || ''),
-            size_gb: parseFloat(ann.size_gb) || 0,
-            total_scoops: safeInt(ann.total_scoops, 0),
-            vrf_public_key: String(ann.vrf_public_key || ''),
-            vrf_output: String(ann.vrf_output || ''),
-            vrf_proof: ann.vrf_proof,
-            public_key: String(ann.public_key || ''),
-            signature: String(ann.signature || ''),
-          };
-          try { if (typeof norm.vrf_proof === 'string' && norm.vrf_proof) norm.vrf_proof = JSON.parse(norm.vrf_proof); } catch { norm.vrf_proof = ''; }
-          const check = verifyAnnouncement(norm, { requireVrf: true, requireSig: true });
-          if (!check.ok) continue;
-          this.db.prepare('INSERT OR REPLACE INTO peer_plot_commitments (plot_id, miner, merkle_root, size_gb, total_scoops, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-            .run(pid, m, norm.merkle_root, norm.size_gb, norm.total_scoops, base,
-              norm.vrf_public_key, norm.vrf_output, JSON.stringify(norm.vrf_proof || ''),
-              norm.signature, norm.public_key, Math.floor(Date.now() / 1000));
-          log('info', `[P2P] Plot ${pid.slice(0, 12)}… de ${m.slice(0, 12)}… aprendido de ${base} (on-demand)`);
-          return this.db.prepare('SELECT plot_id, miner, merkle_root, size_gb, total_scoops FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(pid, m);
-        }
-      }
-    } catch (e) { log('debug', `fetchPlotCommitment falhou: ${e.message}`); }
-    return null;
-  }
-
-  async _syncPeerPlots(peerUrl) {    try {
-      const data = await fetchJSON(`${peerUrl.replace(/\/+$/, '')}/api/plots/announced`, { timeout: 10 });
-      if (!data || !Array.isArray(data.plots)) return 0;
-      const originUrl = String(data.node_url || peerUrl);
-      let stored = 0;
-      for (const ann of data.plots) {
-        const check = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
-        if (!check.ok) continue;
-        this.db.prepare(`INSERT OR REPLACE INTO peer_plot_commitments
-          (plot_id, miner, merkle_root, size_gb, total_scoops, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-          String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root),
-          parseFloat(ann.size_gb) || 0, safeInt(ann.total_scoops, 0), originUrl, String(ann.vrf_public_key || ''),
-          String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
-          String(ann.signature || ''), String(ann.public_key || ''), Math.floor(Date.now() / 1000),
-        );
-        stored++;
-      }
-      if (stored > 0) log('debug', `sync: loaded ${stored} verified plot announcements from ${peerUrl}`);
-      return stored;
-    } catch (e) {
-      log('debug', `sync: plot bootstrap from ${peerUrl} failed: ${e.message}`);
-      return 0;
-    }
-  }
-
   async loopSync() {
     const now = Date.now();
     const cooldown = Math.max(2000, this.cfg.syncIntervalMs || 10000);
@@ -192,7 +112,6 @@ class SyncEngine {
           ));
           if (!remoteBetter) continue;
           log('debug', `loopSync: peer=${peer.url} remoteHeight=${remoteHeight} remoteWork=${remote.chain_work} localHeight=${this.chain.height} localWork=${localTip ? localTip.chain_work : 0}`);
-          await this._syncPeerPlots(peer.url);
           const synced = await this._syncFromPeer(peer.url, remoteHeight);
           if (synced) break;
         } catch (e) { log('debug', `loopSync: peer=${peer.url} error=${e.message}`); }
@@ -307,7 +226,14 @@ class SyncEngine {
           continue;
         }
         block._from_local_forge = false;
-        let res = await this.chain.addBlock(block, { forceSync: true });
+        // The peer tip was compared against our local tip above. Intermediate
+        // blocks on that already-selected heavier branch can have equal work
+        // to the incumbent at the same height; do not apply the final fork
+        // choice independently to each prefix block.
+        let res = await this.chain.addBlock(block, {
+          forceSync: true,
+          allowIntermediateEqualWork: true,
+        });
 
         if (!res.ok) { log('warn', `sync reorg: forceSync insert #${block.height} failed: ${res.motivo}`); return false; }
         inserted++;

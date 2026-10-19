@@ -1,4 +1,4 @@
-const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, evmTxHash, keccak256, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, plotScoopCount, MINING_SCOOP_MODULUS, computeDeadline, expectedMerkleProofLen, verifyMerkleProofBuf, pubkeyToAddress, recoverTransactionSender } = require('../crypto-utils/crypto');
+const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, evmTxHash, keccak256, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, SCOOPS_PER_NONCE, computeDeadline, pubkeyToAddress, recoverTransactionSender } = require('../crypto-utils/crypto');
 
 const { IncrementalStateRoot } = require('./state-trie');
 const { ZkpService } = require('../crypto-utils/zkp-service');
@@ -9,6 +9,7 @@ const { log } = require('../../config/config');
 const { createBlock } = require('@ethereumjs/block');
 const { bytesToHex } = require('@ethereumjs/util');
 const BN = require('bn.js');
+const PocPlotV4 = require('../consensus/poc-plot-v4');
 
 function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; }
 
@@ -36,10 +37,31 @@ class Chain {
     try { this.db.prepare("ALTER TABLE blocks ADD COLUMN rewards_json TEXT DEFAULT '[]'").run(); } catch (e) { /* already exists */ }
     try { this.db.prepare('ALTER TABLE blocks ADD COLUMN body_pruned INTEGER DEFAULT 0').run(); } catch (e) { /* already exists */ }
     try { this.db.prepare('ALTER TABLE transactions ADD COLUMN data TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
+    try { this.db.prepare('ALTER TABLE challenge_submissions ADD COLUMN capacity_samples TEXT DEFAULT "[]"').run(); } catch (e) { /* already exists */ }
+    try { this.db.prepare('ALTER TABLE challenge_submissions ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS plot_registration_events (
+        block_hash TEXT NOT NULL,
+        block_height INTEGER NOT NULL,
+        miner TEXT NOT NULL,
+        plot_id TEXT NOT NULL,
+        merkle_root TEXT NOT NULL,
+        capacity_bytes TEXT NOT NULL,
+        tx_hash TEXT NOT NULL,
+        PRIMARY KEY (block_hash, plot_id, miner),
+        UNIQUE (block_hash, tx_hash),
+        FOREIGN KEY (block_hash) REFERENCES blocks(hash) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_plot_registration_owner ON plot_registration_events(miner, plot_id);
+      CREATE INDEX IF NOT EXISTS idx_plot_registration_height ON plot_registration_events(block_height);
+    `);
     this.stateTrie = new IncrementalStateRoot();
     this.diffManager = new Diff_Manager(db, cfg);
+    this.genesisPlotRegistrations = this._normalizeGenesisPlotRegistrations();
     this._loadTip();
     if (!this.getBlock(0)) this._initGenesis();
+    this._assertGenesisMatchesConfig();
+    this._backfillPlotRegistrationEvents();
     this.stateTrieLoadPromise = this.stateTrie.loadFromDB(this.db).catch(e => log('warn', `State trie init: ${e.message}`));
     try { this.db.prepare('DELETE FROM block_rewards WHERE rowid NOT IN (SELECT MIN(rowid) FROM block_rewards GROUP BY block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) { /* nothing to clean */ }
     try { this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_block_rewards ON block_rewards (block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) { /* duplicates present, skipped */ }
@@ -54,6 +76,223 @@ class Chain {
     } catch (e) { log('warn', `SnapSync service init: ${e.message}`); this.snapsync = null; }
     this.mempoolManager = new MemPool_Manager(db, cfg, this);
     this.contractsManager = new contracts_Manager(db, this);
+  }
+
+  _normalizeGenesisPlotRegistrations() {
+    if (safeInt(this.cfg.genesisTimestamp, -1) <= 0) throw new Error('v4 genesisTimestamp must be a fixed positive Unix timestamp');
+    const configured = this.cfg.genesisPlotRegistrations || [];
+    if (!Array.isArray(configured)) throw new Error('genesisPlotRegistrations must be an array');
+    const plots = configured.map((plot) => {
+      const miner = String(plot && plot.miner || '');
+      if (!/^0x[0-9a-f]{40}$/.test(miner)) throw new Error('genesis plot miner must be a canonical lowercase address');
+      const registration = PocPlotV4.decodeRegistration(PocPlotV4.encodeRegistration({
+        plotId: plot.plot_id,
+        merkleRoot: plot.merkle_root,
+        capacityBytes: plot.capacity_bytes,
+      }));
+      return {
+        miner,
+        plot_id: registration.plot_id,
+        merkle_root: registration.merkle_root,
+        capacity_bytes: registration.capacity_bytes,
+      };
+    }).sort((a, b) => a.plot_id.localeCompare(b.plot_id));
+    const seen = new Set();
+    for (const plot of plots) {
+      if (seen.has(plot.plot_id)) throw new Error(`duplicate genesis plot_id ${plot.plot_id}`);
+      seen.add(plot.plot_id);
+    }
+    if (plots.length === 0) throw new Error('v4 genesis requires at least one genesisPlotRegistrations entry to mine block 1');
+    return plots;
+  }
+
+  _assertGenesisMatchesConfig() {
+    const genesis = this.getBlock(0);
+    if (!genesis) throw new Error('v4 chain is missing its genesis block');
+    const expectedTimestamp = safeInt(this.cfg.genesisTimestamp, -1);
+    const expectedTarget = String(this.cfg.initialTarget || '0x00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF');
+    if (safeInt(genesis.timestamp, -1) !== expectedTimestamp || String(genesis.target) !== expectedTarget) {
+      throw new Error('database genesis timestamp/target do not match the configured v4 network');
+    }
+    if (this.cfg.genesisBaseTarget != null && String(genesis.base_target) !== String(this.cfg.genesisBaseTarget)) {
+      throw new Error('database genesis base target does not match the configured v4 network');
+    }
+    const expectedHash = hashBlock({ ...genesis, chain_id: this.cfg.chainId, genesis_plot_registrations: this.genesisPlotRegistrations });
+    if (genesis.hash !== expectedHash) {
+      throw new Error('database genesis does not match the configured v4 network; use a fresh database and identical genesisPlotRegistrations on every node');
+    }
+    const insertGenesisPlot = this.db.prepare(`
+      INSERT OR IGNORE INTO plot_registration_events
+      (block_hash, block_height, miner, plot_id, merkle_root, capacity_bytes, tx_hash)
+      VALUES (?, 0, ?, ?, ?, ?, ?)
+    `);
+    for (const plot of this.genesisPlotRegistrations) {
+      const commitmentId = sha256hex(`CCPOC:GENESIS:PLOT:V4:${plot.miner}:${plot.plot_id}:${plot.merkle_root}:${plot.capacity_bytes}`);
+      insertGenesisPlot.run(genesis.hash, plot.miner, plot.plot_id, plot.merkle_root, plot.capacity_bytes, commitmentId);
+    }
+    const indexedGenesisPlots = this.db.prepare('SELECT miner, plot_id, merkle_root, capacity_bytes FROM plot_registration_events WHERE block_hash = ? ORDER BY plot_id').all(genesis.hash);
+    if (JSON.stringify(indexedGenesisPlots) !== JSON.stringify(this.genesisPlotRegistrations)) {
+      throw new Error('stored genesis plot index does not match the v4 genesis configuration');
+    }
+  }
+
+  _plotRegistrationsOnAncestry(parentHash, maxHeight = Number.MAX_SAFE_INTEGER) {
+    if (!parentHash) return [];
+    const cutoff = Math.max(0, safeInt(maxHeight, Number.MAX_SAFE_INTEGER));
+    return this.db.prepare(`
+      WITH RECURSIVE ancestry(hash, parent_hash, height, depth) AS (
+        SELECT hash, parent_hash, height, 0 FROM blocks WHERE hash = ?
+        UNION ALL
+        SELECT b.hash, b.parent_hash, b.height, a.depth + 1
+        FROM blocks b JOIN ancestry a ON b.hash = a.parent_hash
+        WHERE a.height > 0 AND a.depth < 1000000
+      )
+      SELECT e.block_hash, e.block_height, e.miner, e.plot_id, e.merkle_root,
+        e.capacity_bytes, e.tx_hash
+      FROM plot_registration_events e
+      JOIN ancestry a ON a.hash = e.block_hash
+      WHERE e.block_height <= ?
+      ORDER BY e.block_height, e.tx_hash
+    `).all(parentHash, cutoff);
+  }
+
+  getPlotRegistration(plotId, miner, parentHash, maxHeight = Number.MAX_SAFE_INTEGER) {
+    const id = String(plotId || '').toLowerCase();
+    const owner = String(miner || '').toLowerCase();
+    const matches = this._plotRegistrationsOnAncestry(parentHash, Math.max(0, maxHeight)).filter((r) => r.plot_id === id);
+    if (matches.length !== 1 || matches[0].miner !== owner) return null;
+    return matches[0];
+  }
+
+  getPlotRegistrations(parentHash, maxHeight = Number.MAX_SAFE_INTEGER) {
+    return this._plotRegistrationsOnAncestry(parentHash, maxHeight);
+  }
+
+  getMaturePlotRegistrations(parentHash, winnerHeight) {
+    const matureHeight = safeInt(winnerHeight, 0) - 2;
+    if (safeInt(winnerHeight, 0) <= 0) return [];
+    const rows = this._plotRegistrationsOnAncestry(parentHash, Math.max(0, matureHeight))
+      .filter((row) => row.block_height === 0 || row.block_height <= matureHeight);
+    const ids = new Set();
+    for (const row of rows) {
+      if (ids.has(row.plot_id)) throw new Error(`duplicate plot_id ${row.plot_id} in parent ancestry`);
+      ids.add(row.plot_id);
+    }
+    return rows;
+  }
+
+  verifyPocV4CapacityProof(proof, challengeId, miner, plotId, winnerHeight, parentHash) {
+    try {
+      const registration = this.getPlotRegistration(plotId, miner, parentHash, Math.max(0, winnerHeight - 2));
+      if (!registration) return { ok: false, motivo: 'plot registration is not present and mature on the parent ancestry' };
+      const totalLeaves = Number(BigInt(registration.capacity_bytes) / 32n);
+      const totalScoops = safeInt(proof && proof.total_scoops, -1);
+      if (totalScoops !== totalLeaves) return { ok: false, motivo: 'winner_proof total_scoops does not match registered capacity' };
+      if (String(proof.merkle_root || '').toLowerCase() !== registration.merkle_root) {
+        return { ok: false, motivo: 'winner_proof root does not match mature on-chain registration' };
+      }
+      const targetSlot = PocPlotV4.challengeTargetSlot(challengeId);
+      const index = safeInt(proof.scoop_index, -1);
+      if (index < 0 || index >= totalLeaves || index % SCOOPS_PER_NONCE !== targetSlot) {
+        return { ok: false, motivo: 'winner_proof index is not the canonical v4 target slot' };
+      }
+      const targetLeaf = PocPlotV4.canonicalLeaf({
+        chainId: this.cfg.chainId,
+        miner,
+        plotId,
+        index,
+      });
+      if (String(proof.scoop_data || '') !== targetLeaf.toString('hex')) {
+        return { ok: false, motivo: 'winner_proof target leaf is not canonical for this chain and plot' };
+      }
+      if (!PocPlotV4.verifyCanonicalMerkleProof(targetLeaf, index, totalLeaves, proof.merkle_proof, registration.merkle_root)) {
+        return { ok: false, motivo: 'winner_proof target Merkle path is invalid' };
+      }
+      const expectedSamples = PocPlotV4.deriveCapacitySampleIndexes(
+        challengeId, totalLeaves, plotId, PocPlotV4.SAMPLE_COUNT, PocPlotV4.SAMPLE_ROUND, [index],
+      );
+      if (!Array.isArray(proof.capacity_samples) || proof.capacity_samples.length !== expectedSamples.length) {
+        return { ok: false, motivo: 'winner_proof must contain exactly 16 capacity samples' };
+      }
+      for (let i = 0; i < expectedSamples.length; i++) {
+        const sample = proof.capacity_samples[i];
+        const sampleIndex = safeInt(sample && sample.index, -1);
+        if (sampleIndex !== expectedSamples[i]) return { ok: false, motivo: 'capacity samples are missing, duplicated, or out of canonical order' };
+        const expectedLeaf = PocPlotV4.canonicalLeaf({ chainId: this.cfg.chainId, miner, plotId, index: sampleIndex });
+        if (String(sample.leaf || '') !== expectedLeaf.toString('hex')) return { ok: false, motivo: `capacity sample ${i} leaf is not canonical` };
+        if (!PocPlotV4.verifyCanonicalMerkleProof(expectedLeaf, sampleIndex, totalLeaves, sample.merkle_proof, registration.merkle_root)) {
+          return { ok: false, motivo: `capacity sample ${i} Merkle path is invalid` };
+        }
+      }
+      return { ok: true, registration, totalLeaves, targetSlot };
+    } catch (e) {
+      return { ok: false, motivo: e.message || 'invalid v4 capacity proof' };
+    }
+  }
+
+  _preparePlotRegistrationEvents(txs, height, parentHash) {
+    const events = [];
+    const currentIds = new Set();
+    const prior = this._plotRegistrationsOnAncestry(parentHash);
+    const knownIds = new Set(prior.map((r) => r.plot_id));
+    for (const tx of txs) {
+      if (!PocPlotV4.isRegistrationPayload(tx && tx.data)) continue;
+      let registration;
+      try { registration = PocPlotV4.decodeRegistration(tx.data); }
+      catch (e) { throw new Error(`invalid v4 plot registration: ${e.message}`); }
+      const sender = String(tx.from_addr || '');
+      let value;
+      try { value = BigInt(tx.value == null ? '0' : tx.value); } catch { value = -1n; }
+      const envelopeValid = sender === sender.toLowerCase()
+        && /^0x[0-9a-f]{40}$/.test(sender)
+        && String(tx.to_addr || '') === PocPlotV4.ZERO_ADDRESS
+        && value === 0n
+        && String(tx.chain_id) === String(this.cfg.chainId);
+      if (!envelopeValid) {
+        throw new Error('v4 plot registration must be a canonical zero-value transaction to the zero address');
+      }
+      if (knownIds.has(registration.plot_id) || currentIds.has(registration.plot_id)) {
+        throw new Error(`plot_id ${registration.plot_id} is already registered in this ancestry`);
+      }
+      currentIds.add(registration.plot_id);
+      events.push({
+        block_height: height,
+        miner: sender,
+        plot_id: registration.plot_id,
+        merkle_root: registration.merkle_root,
+        capacity_bytes: registration.capacity_bytes,
+        tx_hash: tx.hash || hashTransaction(tx),
+      });
+    }
+    return events;
+  }
+
+  _backfillPlotRegistrationEvents() {
+    const rows = this.db.prepare(`
+      SELECT t.hash, t.from_addr, t.to_addr, t.value, t.data, t.chain_id,
+        b.hash AS block_hash, b.height AS block_height
+      FROM transactions t JOIN blocks b ON b.hash = t.block_hash
+      WHERE t.data LIKE '0x43435043%'
+    `).all();
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO plot_registration_events
+      (block_hash, block_height, miner, plot_id, merkle_root, capacity_bytes, tx_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const save = this.db.transaction(() => {
+      for (const tx of rows) {
+        try {
+          const reg = PocPlotV4.decodeRegistration(tx.data);
+          if (String(tx.from_addr || '') !== String(tx.from_addr || '').toLowerCase()
+            || !/^0x[0-9a-f]{40}$/.test(String(tx.from_addr || ''))
+            || String(tx.to_addr || '').toLowerCase() !== PocPlotV4.ZERO_ADDRESS
+            || BigInt(tx.value || '0') !== 0n
+            || String(tx.chain_id) !== String(this.cfg.chainId)) continue;
+          insert.run(tx.block_hash, tx.block_height, tx.from_addr, reg.plot_id, reg.merkle_root, reg.capacity_bytes, tx.hash);
+        } catch { /* historical ordinary transactions are not registration events */ }
+      }
+    });
+    save();
   }
 
   // ================== Diff Manager things ==================================
@@ -94,14 +333,14 @@ class Chain {
     const reward = calculateMiningReward(0, cfg);
     const state_root = computeStateRoot(this.db);
     const genesis = {
-      height: 0, parent_hash: ZERO_HASH, timestamp: now,
+      height: 0, chain_id: this.cfg.chainId, parent_hash: ZERO_HASH, timestamp: now,
       miner: 'genesis', challenge_id: '', tx_root: ZERO_HASH,
       nonce: '0', difficulty: '0', target: String(target),
       reward_units: '0', reward_cc: String(reward), tx_count: 0,
       signature: '', generation_signature: ZERO_HASH,
       proof_digest: '', plot_id: '', state_root,
       origin: 'genesis', total_fees_units: '0', gas_used: 0, gas_limit: GAS_PARAMS.blockGasLimit, base_target: String(this.cfg.genesisBaseTarget ?? this._defaultBaseTarget()),
-      transactions: [], rewards: [],
+      transactions: [], rewards: [], genesis_plot_registrations: this.genesisPlotRegistrations,
     };
     genesis.hash = hashBlock(genesis);
     try {
@@ -116,6 +355,15 @@ class Chain {
         String(totalFees), gasUsed, GAS_PARAMS.blockGasLimit, genesis.base_target, String(GAS_PARAMS.initialBaseFee),
         genesis.contract_state_root || '', genesis.forger || '', '[]'
       );
+      const insertGenesisPlot = this.db.prepare(`
+        INSERT INTO plot_registration_events
+        (block_hash, block_height, miner, plot_id, merkle_root, capacity_bytes, tx_hash)
+        VALUES (?, 0, ?, ?, ?, ?, ?)
+      `);
+      for (const plot of this.genesisPlotRegistrations) {
+        const commitmentId = sha256hex(`CCPOC:GENESIS:PLOT:V4:${plot.miner}:${plot.plot_id}:${plot.merkle_root}:${plot.capacity_bytes}`);
+        insertGenesisPlot.run(genesis.hash, plot.miner, plot.plot_id, plot.merkle_root, plot.capacity_bytes, commitmentId);
+      }
       this.height = 0;
       this.bestHash = genesis.hash;
       log('info', `Genesis block created — hash: ${genesis.hash.slice(0, 16)}`);
@@ -227,9 +475,11 @@ class Chain {
     const totalTxs = this.db.prepare('SELECT COUNT(*) as c FROM transactions').get().c;
     const wallets = this.db.prepare('SELECT COUNT(*) as c FROM users').get().c;
     const mempoolCount = this.db.prepare('SELECT COUNT(*) as c FROM mempool').get().c;
-    const plotsCount = this.db.prepare('SELECT COUNT(DISTINCT plot_id) as c FROM plot_commitments').get().c;
-    const capacityGbRaw = this.db.prepare('SELECT COALESCE(SUM(size_gb), 0) as s FROM (SELECT DISTINCT plot_id, size_gb FROM plot_commitments)').get().s;
-    const capacityGb = Number(capacityGbRaw) || 0;
+    let plotsCount;
+    let capacityGb;
+    const registrations = tip ? this.getMaturePlotRegistrations(tip.hash, this.height + 1) : [];
+    plotsCount = registrations.length;
+    capacityGb = Number(registrations.reduce((sum, r) => sum + BigInt(r.capacity_bytes), 0n)) / (1024 ** 3);
     const totalBlocks = this.db.prepare('SELECT COUNT(*) as c FROM blocks').get().c;
     const supply = this.db.prepare("SELECT balance FROM users").all().reduce((s, r) => s + safeBigInt(r.balance, 0n), 0n).toString();
     return {
@@ -243,10 +493,16 @@ class Chain {
   }
 
   async addBlock(bloco, opts = {}) {
-    const { forceSync = false, allowEqualWork = false, allowVotedTie = false } = opts;
+    const {
+      forceSync = false,
+      allowEqualWork = false,
+      allowVotedTie = false,
+      allowIntermediateEqualWork = false,
+    } = opts;
     const isLocalForge = !!bloco._from_local_forge;
     const blockOrigin = isLocalForge ? 'local' : 'network';
     delete bloco._from_local_forge;
+    let plotRegistrationEvents = [];
     const height = bloco.height;
     const parent = height > 0
       ? this.db.prepare('SELECT height, timestamp, hash, chain_work, generation_signature FROM blocks WHERE hash = ?').get(bloco.parent_hash)
@@ -316,6 +572,11 @@ class Chain {
       if (!ok) return { ok: false, motivo };
       if (!this._txRootMatches(bloco)) return { ok: false, motivo: 'tx_root mismatch' };
       if (safeInt(bloco.tx_count, txs.length) !== txs.length) return { ok: false, motivo: 'tx_count mismatch' };
+      try {
+        plotRegistrationEvents = this._preparePlotRegistrationEvents(txs, height, parent.hash);
+      } catch (e) {
+        return { ok: false, motivo: e.message || 'invalid plot registration transaction' };
+      }
     }
     if (height > 0) {
       if (!bloco.signature) return { ok: false, motivo: 'block not signed' };
@@ -372,22 +633,13 @@ class Chain {
         if (!wp.proof_signature) {
           return { ok: false, motivo: 'winner_proof not signed' };
         }
-        const wpPkRow = this.db.prepare('SELECT public_key_secp256k1 FROM user_keys WHERE lower(address) = lower(?)').get(wpMiner)
-          || this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(wpMiner);
-        const peerPkRow = this.db.prepare('SELECT public_key FROM peer_plot_commitments WHERE lower(miner) = lower(?) AND public_key IS NOT NULL AND public_key != \'\' ORDER BY created_at DESC LIMIT 1').get(wpMiner);
-        const wpCandidates = [
-          String(wp.public_key || ''),
-          String((wpPkRow && wpPkRow.public_key_secp256k1) || ''),
-          String((peerPkRow && peerPkRow.public_key) || ''),
-        ];
-        let wpPk = '';
-        for (const cand of wpCandidates) {
-          if (!cand) continue;
-          try { if (pubkeyToAddress(cand).toLowerCase() === wpMiner) { wpPk = cand; break; } } catch { /* candidate inválido, tentar a próxima */ }
-        }
+        const wpPk = String(wp.public_key || '');
         if (!wpPk) {
           return { ok: false, motivo: 'winner_proof miner has no public key' };
         }
+        try {
+          if (pubkeyToAddress(wpPk).toLowerCase() !== wpMiner) return { ok: false, motivo: 'winner_proof public key does not match miner' };
+        } catch { return { ok: false, motivo: 'winner_proof miner public key is invalid' }; }
         const wpMsg = proofMessage(bloco.challenge_id, wpMiner, wpDeadline, wpPlotId);
         const wpSigValid = await verifySignatureAsync(wpMsg, wp.proof_signature, wpPk);
         if (!wpSigValid) {
@@ -403,34 +655,16 @@ class Chain {
         if (totalScoops < 1 || scoopIndex < 0 || scoopIndex >= totalScoops) {
           return { ok: false, motivo: `winner_proof invalid scoop_index ${scoopIndex} for ${totalScoops} scoops` };
         }
-        const merkleProof = Array.isArray(wp.merkle_proof) ? wp.merkle_proof : [];
         const merkleRootClaim = String(wp.merkle_root || '');
         if (!/^[0-9a-fA-F]{64}$/.test(merkleRootClaim)) {
           return { ok: false, motivo: 'winner_proof missing merkle_root' };
         }
-        const knownPlot = this.db.prepare('SELECT merkle_root, size_gb FROM plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(wpPlotId, wpMiner)
-          || this.db.prepare('SELECT merkle_root, size_gb FROM peer_plot_commitments WHERE plot_id = ? AND lower(miner) = lower(?)').get(wpPlotId, wpMiner);
-        if (knownPlot && knownPlot.merkle_root) {
-          if (knownPlot.merkle_root.toLowerCase() !== merkleRootClaim.toLowerCase()) {
-            return { ok: false, motivo: 'winner_proof merkle_root does not match committed plot root' };
-          }
-        } else {
-          log('debug', `addBlock #${height}: plot ${wpPlotId.slice(0, 12)}… sem commitment local, validação autónoma`);
-          const needProofLen = expectedMerkleProofLen(scoopIndex, totalScoops);
-          if (merkleProof.length !== needProofLen) {
-            return { ok: false, motivo: `winner_proof merkle proof length ${merkleProof.length} inconsistent with scoop_index ${scoopIndex} for ${totalScoops} scoops (expected ${needProofLen})` };
-          }
+        const registration = this.getPlotRegistration(wpPlotId, wpMiner, parent.hash, Math.max(0, height - 2));
+        if (!registration || (registration.block_height !== 0 && registration.block_height > height - 2)) {
+          return { ok: false, motivo: 'winner plot has no mature registration on the parent ancestry' };
         }
-        const expectedTargetIdx = challenge.target_scoop_index != null
-          ? safeInt(challenge.target_scoop_index, -1)
-          : parseInt(sha256hex(String(challenge.challenge_seed || '')).slice(0, 8), 16) % MINING_SCOOP_MODULUS;
-        if (scoopIndex % MINING_SCOOP_MODULUS !== expectedTargetIdx) {
-          return { ok: false, motivo: `winner_proof scoop_index ${scoopIndex} is not the challenge target scoop (expected mod ${MINING_SCOOP_MODULUS} == ${expectedTargetIdx})` };
-        }
-        const leafHash = Buffer.from(scoopData, 'hex');
-        if (!verifyMerkleProofBuf(leafHash, scoopIndex, totalScoops, merkleProof, merkleRootClaim)) {
-          return { ok: false, motivo: 'winner_proof merkle proof does not match committed plot root' };
-        }
+        const v4Proof = this.verifyPocV4CapacityProof(wp, bloco.challenge_id, wpMiner, wpPlotId, height, parent.hash);
+        if (!v4Proof.ok) return { ok: false, motivo: v4Proof.motivo };
         const genSig = String(wp.challenge_seed || '');
         if (!genSig) {
           return { ok: false, motivo: 'winner_proof missing challenge_seed' };
@@ -476,9 +710,10 @@ class Chain {
         if (height <= this.height - FINALIZATION_DEPTH) return { ok: false, motivo: 'cannot replace finalized block during sync' };
         const incumbent = this.getBlockByHash(existingAtHeight.hash);
         const incumbentWork = safeBigInt(existingAtHeight.chain_work, 0n);
-        const equalWorkTie = newWork === incumbentWork
-          && allowEqualWork
-          && (allowVotedTie || isBetterChainCandidate(bloco, incumbent));
+        const equalWorkTie = newWork === incumbentWork && (
+          allowIntermediateEqualWork
+          || (allowEqualWork && (allowVotedTie || isBetterChainCandidate(bloco, incumbent)))
+        );
         if (newWork < incumbentWork) return { ok: false, motivo: 'forced candidate does not have more chain work' };
         if (newWork === incumbentWork && !equalWorkTie) {
           return { ok: false, motivo: 'forced candidate does not have more chain work or a valid tie-break' };
@@ -624,6 +859,17 @@ class Chain {
           JSON.stringify(Array.isArray(bloco.rewards) ? bloco.rewards : []),
           bloco.winner_proof && typeof bloco.winner_proof === 'object' ? JSON.stringify(bloco.winner_proof) : '',
         );
+        if (plotRegistrationEvents.length) {
+          const insertRegistration = this.db.prepare(`
+            INSERT INTO plot_registration_events
+            (block_hash, block_height, miner, plot_id, merkle_root, capacity_bytes, tx_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const event of plotRegistrationEvents) {
+            insertRegistration.run(bloco.hash, event.block_height, event.miner, event.plot_id,
+              event.merkle_root, event.capacity_bytes, event.tx_hash);
+          }
+        }
         {
           const actualStateRoot = computeStateRoot(this.db);
           const claimedStateRoot = bloco.state_root || '';
@@ -815,8 +1061,12 @@ class Chain {
   }
 
   computeMaxDeadline() {
-    const row = this.db.prepare('SELECT COALESCE(SUM(size_gb), 0) as total FROM plot_commitments').get();
-    const capacity = parseFloat(row ? row.total : 0) || 0;
+    const tip = this.getBlock(this.height);
+    let bytes = 0n;
+    if (tip) {
+      for (const plot of this.getMaturePlotRegistrations(tip.hash, this.height + 1)) bytes += BigInt(plot.capacity_bytes);
+    }
+    const capacity = Number(bytes) / (1024 ** 3);
     const expected = this.cfg.expectedTimePerBlock || 60;
     if (capacity <= 0) return 21600;
     return Math.max(600, Math.min(86400, Math.floor(expected * 36000 / Math.max(capacity, 1))));
@@ -1143,19 +1393,13 @@ class Diff_Manager {
   _defaultBaseTarget() {
     const blockTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
     let candidates = 0n;
-    try {
-      const rows = this.db.prepare('SELECT DISTINCT plot_id, size_gb FROM plot_commitments').all();
-      for (const r of rows) {
-        const sizeGb = Math.max(0.001, parseFloat(r.size_gb) || 0.001);
-        const total = plotScoopCount(sizeGb);
-        candidates += BigInt(Math.max(1, Math.ceil(total / MINING_SCOOP_MODULUS)));
+    const tip = this.getBlock(this.height);
+    if (tip) {
+      for (const plot of this.getMaturePlotRegistrations(tip.hash, this.height + 1)) {
+        candidates += BigInt(BigInt(plot.capacity_bytes) / BigInt(PocPlotV4.NONCE_BYTES));
       }
-    } catch {}
-    if (candidates < 1n) {
-      const fallbackSizeGb = Math.max(1, Number(this.cfg.initialPlotGb || 10));
-      const total = plotScoopCount(fallbackSizeGb);
-      candidates = BigInt(Math.max(1, Math.ceil(total / MINING_SCOOP_MODULUS)));
     }
+    if (candidates < 1n) candidates = 1n;
     const bt = (BigInt(2) ** BigInt(64)) / (candidates * BigInt(blockTime));
     const MAX_BT = BigInt('1000000000000000000');
     return String(bt < 1n ? 1n : bt > MAX_BT ? MAX_BT : bt);
@@ -1164,19 +1408,13 @@ class Diff_Manager {
   _baseTargetCapacity() {
     const blockTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
     let candidates = 0n;
-    try {
-      const rows = this.db.prepare('SELECT DISTINCT plot_id, size_gb FROM plot_commitments').all();
-      for (const r of rows) {
-        const sizeGb = Math.max(0.001, parseFloat(r.size_gb) || 0.001);
-        const total = plotScoopCount(sizeGb);
-        candidates += BigInt(Math.max(1, Math.ceil(total / MINING_SCOOP_MODULUS)));
+    const tip = this.getBlock(this.height);
+    if (tip) {
+      for (const plot of this.getMaturePlotRegistrations(tip.hash, this.height + 1)) {
+        candidates += BigInt(BigInt(plot.capacity_bytes) / BigInt(PocPlotV4.NONCE_BYTES));
       }
-    } catch {}
-    if (candidates < 1n) {
-      const fallbackSizeGb = Math.max(1, Number(this.cfg.initialPlotGb || 10));
-      const total = plotScoopCount(fallbackSizeGb);
-      candidates = BigInt(Math.max(1, Math.ceil(total / MINING_SCOOP_MODULUS)));
     }
+    if (candidates < 1n) candidates = 1n;
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(blockTime));
   }
 
@@ -1327,6 +1565,22 @@ class MemPool_Manager {
     if (safeBigInt(tx.gas_price, 0n) < currentBaseFee) return { ok: false, motivo: `gas_price below base fee (${currentBaseFee})` };
     const minFee = minimumFee(tx, currentBaseFee);
     if (safeBigInt(tx.fee, 0n) < minFee) return { ok: false, motivo: `fee too low (need ${minFee} = intrinsic ${estimateIntrinsicGas(tx)} * baseFee ${currentBaseFee})` };
+
+    if (PocPlotV4.isRegistrationPayload(tx.data)) {
+      let events;
+      try { events = this.chain._preparePlotRegistrationEvents([tx], this.chain.height + 1, this.chain.bestHash); }
+      catch (e) { return { ok: false, motivo: e.message || 'invalid v4 plot registration' }; }
+      if (events.length !== 1) return { ok: false, motivo: 'invalid v4 plot registration transaction' };
+      const pending = this.db.prepare('SELECT raw FROM mempool').all();
+      for (const row of pending) {
+        try {
+          const other = JSON.parse(row.raw);
+          if (!PocPlotV4.isRegistrationPayload(other.data)) continue;
+          const registration = PocPlotV4.decodeRegistration(other.data);
+          if (registration.plot_id === events[0].plot_id) return { ok: false, motivo: 'plot_id already has a pending registration' };
+        } catch { /* malformed unrelated mempool entry */ }
+      }
+    }
 
     return { ok: true, motivo: 'valid' };
   }
