@@ -576,9 +576,6 @@ class Chain {
         const intrinsic = estimateIntrinsicGas(tx);
         const gasLimit = safeInt(tx.gas_limit, 0);
         if (gasLimit < intrinsic || gasLimit > GAS_PARAMS.maxGasPerTx) return { ok: false, motivo: 'invalid transaction gas_limit' };
-        // v4 plot registrations are zero-fee protocol declarations: they must be
-        // canonical zero-value txs to the zero address and are exempt from the
-        // gas_price/fee minimums (anti-spam is handled by per-block caps).
         if (PocPlotV4.isRegistrationPayload(tx.data)) continue;
         if (safeBigInt(tx.gas_price, 0n) < blockBaseFee) return { ok: false, motivo: 'transaction gas_price below base fee' };
         if (safeBigInt(tx.fee, 0n) < minimumFee(tx, blockBaseFee)) return { ok: false, motivo: 'transaction fee below minimum' };
@@ -1402,7 +1399,6 @@ class Diff_Manager {
     const latest = this.db.prepare('SELECT timestamp FROM blocks WHERE height = ?').get(height - 1);
     if (prevInterval && latest) {
       const actual = latest.timestamp - prevInterval.timestamp;
-      // actual is the timespan of (interval) blocks, not a single block
       const expectedSpan = expected * interval;
       const target = BigInt(this._targetForHeight(height - 1));
       if (actual < expectedSpan / 2) return target * 2n;
@@ -1449,10 +1445,6 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(blockTime));
   }
 
-  // Capacity-derived reference base target for a block at `height`: the value
-  // that makes the expected best deadline of every mature registration match
-  // `expectedTimePerBlock`. Pure function of the chain up to `height - 1`
-  // (explicit parent lookup, not this.height), so all nodes agree.
   _baseTargetIdealFor(height) {
     const expectedTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
     let candidates = 0n;
@@ -1466,8 +1458,6 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(expectedTime));
   }
 
-  // Clamp a candidate base target: keep it within a generous, scale-free factor
-  // of the capacity-derived reference, then inside [baseTargetMin, baseTargetMax].
   _clampBaseTarget(value, ideal) {
     let t = value;
     if (ideal && ideal > 0n) {
@@ -1493,18 +1483,8 @@ class Diff_Manager {
     const prevTarget = BigInt((prev && prev.base_target) || this._defaultBaseTarget());
     const ideal = this._baseTargetIdealFor(height);
 
-    // Re-evaluate at most once per window; between windows the base target is
-    // frozen. The old code applied a +/-30% step to *every* block, which
-    // compounded into an exponential runaway and drove the base target down to
-    // an un-mineable floor whenever the miner was faster than the target.
     const window = Math.max(8, safeInt(this.cfg.baseTargetWindow, 128));
 
-    // Bootstrap: until one full measurement window exists, follow the
-    // capacity-derived reference directly instead of the fixed genesis value.
-    // `genesisBaseTarget` assumes a large network; on a small one it is several
-    // times too low and each block then takes minutes, so the first window
-    // would be hours away. Tracking the reference self-sizes the network
-    // immediately, and the feedback step below refines it afterwards.
     if (height < window) {
       const seed = ideal && ideal > 0n ? ideal : prevTarget;
       return String(this._clampBaseTarget(seed, ideal));
@@ -1517,10 +1497,6 @@ class Diff_Manager {
     const actualDuration = prev.timestamp - oldest.timestamp;
     if (actualDuration <= 0) return String(prevTarget);
 
-    // Proportional step: deadline scales as 1/baseTarget, so measured/expected
-    // drives the base target straight to the target block time. Bounded per
-    // window to avoid overshoot from a noisy measurement, then clamped against
-    // the capacity reference so a noisy measurement cannot run it away.
     const meanSeconds = actualDuration / window;
     const maxMove = Math.min(0.9, Math.max(0.01, Number(this.cfg.baseTargetMaxMove ?? 0.5)));
     const ratio = meanSeconds / expectedTime;
@@ -1624,11 +1600,6 @@ class MemPool_Manager {
     const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(sender);
     const curNonce = user ? safeInt(user.nonce, 0) : 0;
     const curBalance = user ? safeBigInt(user.balance, 0n) : 0n;
-    // Accept the confirmed nonce or any near-future nonce: a client preparing
-    // several txs back to back (e.g. auto-registering multiple plots) hands out
-    // consecutive nonces, and nonce-gapped txs simply stay queued until their
-    // predecessors are mined. This matches the forger's sequential selection
-    // (which only drops nonces below the projected value).
     const txNonce = safeInt(tx.nonce, 0);
     if (txNonce < curNonce) return { ok: false, motivo: `stale nonce (tx=${txNonce}, account=${curNonce})` };
     const maxFutureNonce = curNonce + Math.max(1, safeInt(this.cfg.maxFutureNonce, 64));
