@@ -56,7 +56,7 @@ class Chain {
       CREATE INDEX IF NOT EXISTS idx_plot_registration_height ON plot_registration_events(block_height);
     `);
     this.stateTrie = new IncrementalStateRoot();
-    this.diffManager = new Diff_Manager(db, cfg);
+    this.diffManager = new Diff_Manager(db, cfg, this);
     this.genesisPlotRegistrations = this._normalizeGenesisPlotRegistrations();
     this._loadTip();
     if (!this.getBlock(0)) this._initGenesis();
@@ -235,6 +235,9 @@ class Chain {
     const currentIds = new Set();
     const prior = this._plotRegistrationsOnAncestry(parentHash);
     const knownIds = new Set(prior.map((r) => r.plot_id));
+    const maxPerBlock = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerBlock, 4));
+    const maxPerMiner = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerMinerPerBlock, 1));
+    const perMiner = new Map();
     for (const tx of txs) {
       if (!PocPlotV4.isRegistrationPayload(tx && tx.data)) continue;
       let registration;
@@ -254,6 +257,14 @@ class Chain {
       if (knownIds.has(registration.plot_id) || currentIds.has(registration.plot_id)) {
         throw new Error(`plot_id ${registration.plot_id} is already registered in this ancestry`);
       }
+      if (events.length >= maxPerBlock) {
+        throw new Error(`too many v4 plot registrations in one block (max ${maxPerBlock})`);
+      }
+      const already = perMiner.get(sender) || 0;
+      if (already >= maxPerMiner) {
+        throw new Error(`miner ${sender} exceeds ${maxPerMiner} v4 plot registration(s) per block`);
+      }
+      perMiner.set(sender, already + 1);
       currentIds.add(registration.plot_id);
       events.push({
         block_height: height,
@@ -384,7 +395,7 @@ class Chain {
     const totalReward = calculateMiningReward(bloco.height, this.cfg);
     const maxSupply = safeBigInt(this.cfg.maxSupply, 0n);
     if (maxSupply > 0n) {
-      const emitted = this.db.prepare('SELECT reward_units FROM blocks WHERE height > 0').all().reduce((sum, row) => sum + safeBigInt(row.reward_units, 0n), 0n);
+      const emitted = this.db.prepare('SELECT reward_cc FROM blocks WHERE height > 0').all().reduce((sum, row) => sum + safeBigInt(row.reward_cc, 0n), 0n);
       if (safeBigInt(emitted, 0n) + totalReward > maxSupply) return { ok: false, motivo: 'max supply exceeded' };
     }
     let subKeys = null;
@@ -565,6 +576,10 @@ class Chain {
         const intrinsic = estimateIntrinsicGas(tx);
         const gasLimit = safeInt(tx.gas_limit, 0);
         if (gasLimit < intrinsic || gasLimit > GAS_PARAMS.maxGasPerTx) return { ok: false, motivo: 'invalid transaction gas_limit' };
+        // v4 plot registrations are zero-fee protocol declarations: they must be
+        // canonical zero-value txs to the zero address and are exempt from the
+        // gas_price/fee minimums (anti-spam is handled by per-block caps).
+        if (PocPlotV4.isRegistrationPayload(tx.data)) continue;
         if (safeBigInt(tx.gas_price, 0n) < blockBaseFee) return { ok: false, motivo: 'transaction gas_price below base fee' };
         if (safeBigInt(tx.fee, 0n) < minimumFee(tx, blockBaseFee)) return { ok: false, motivo: 'transaction fee below minimum' };
       }
@@ -1195,8 +1210,11 @@ class Chain {
           bal[tx.from_addr] = (bal[tx.from_addr] || 0n) - BigInt(tx.value || 0) - BigInt(tx.fee || 0);
           nonces[tx.from_addr] = Math.max(nonces[tx.from_addr] || 0, safeInt(tx.nonce, 0) + 1);
         }
-        if (tx.to_addr && !this.db.prepare('SELECT 1 FROM smart_contracts WHERE lower(address) = lower(?)').get(tx.to_addr)) {
-          bal[tx.to_addr] = (bal[tx.to_addr] || 0n) + BigInt(tx.value || 0);
+        if (tx.to_addr) {
+          const isContract = !!this.db.prepare('SELECT 1 FROM smart_contracts WHERE lower(address) = lower(?)').get(tx.to_addr);
+          if (!isContract) {
+            bal[tx.to_addr] = (bal[tx.to_addr] || 0n) + BigInt(tx.value || 0);
+          }
         }
       }
     }
@@ -1351,9 +1369,22 @@ class Chain {
 }
 
 class Diff_Manager {
-  constructor(db, cfg) {
+  constructor(db, cfg, chain) {
     this.db = db;
     this.cfg = cfg;
+    this.chain = chain;
+  }
+
+  getBlock(heightOrHash) {
+    return this.chain ? this.chain.getBlock(heightOrHash) : null;
+  }
+
+  getMaturePlotRegistrations(parentHash, winnerHeight) {
+    return this.chain ? this.chain.getMaturePlotRegistrations(parentHash, winnerHeight) : [];
+  }
+
+  get height() {
+    return this.chain ? this.chain.height : 0;
   }
 
   _targetForHeight(height) {
@@ -1418,41 +1449,85 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(blockTime));
   }
 
+  // Capacity-derived reference base target for a block at `height`: the value
+  // that makes the expected best deadline of every mature registration match
+  // `expectedTimePerBlock`. Pure function of the chain up to `height - 1`
+  // (explicit parent lookup, not this.height), so all nodes agree.
+  _baseTargetIdealFor(height) {
+    const expectedTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
+    let candidates = 0n;
+    const parent = this.db.prepare('SELECT hash FROM blocks WHERE height = ?').get(height - 1);
+    if (parent) {
+      for (const plot of this.getMaturePlotRegistrations(parent.hash, height)) {
+        candidates += BigInt(BigInt(plot.capacity_bytes) / BigInt(PocPlotV4.NONCE_BYTES));
+      }
+    }
+    if (candidates < 1n) return null;
+    return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(expectedTime));
+  }
+
+  // Clamp a candidate base target: keep it within a generous, scale-free factor
+  // of the capacity-derived reference, then inside [baseTargetMin, baseTargetMax].
+  _clampBaseTarget(value, ideal) {
+    let t = value;
+    if (ideal && ideal > 0n) {
+      const anchor = BigInt(Math.max(2, safeInt(this.cfg.baseTargetAnchorFactor, 16)));
+      const lo = ideal / anchor;
+      const hi = ideal * anchor;
+      if (t < lo) t = lo;
+      if (t > hi) t = hi;
+    }
+    const minB = safeBigInt(this.cfg.baseTargetMin, 2n ** 32n);
+    const maxB = safeBigInt(this.cfg.baseTargetMax, 2n ** 56n);
+    if (t < minB) t = minB;
+    if (t > maxB) t = maxB;
+    if (t < 1n) t = 1n;
+    return t;
+  }
+
   _baseTargetForHeight(height) {
-    const MAX_BASE_TARGET = 2n ** 43n; // max possible base target, around 8.4k G
     const expectedTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
     if (height === 0) return String(this.cfg.genesisBaseTarget ?? this._defaultBaseTarget());
     const prev = this.db.prepare('SELECT base_target, timestamp FROM blocks WHERE height = ?').get(height - 1);
     if (!prev) return this._defaultBaseTarget();
     const prevTarget = BigInt((prev && prev.base_target) || this._defaultBaseTarget());
-    if (height <= 16) return String(prevTarget);
+    const ideal = this._baseTargetIdealFor(height);
 
-    const windowSize = Math.min(256, this.cfg.difficultyAdjustBlocks || 64);
-    const window = Math.min(Math.max(8, Math.floor(height / 8)), windowSize);
+    // Re-evaluate at most once per window; between windows the base target is
+    // frozen. The old code applied a +/-30% step to *every* block, which
+    // compounded into an exponential runaway and drove the base target down to
+    // an un-mineable floor whenever the miner was faster than the target.
+    const window = Math.max(8, safeInt(this.cfg.baseTargetWindow, 128));
+
+    // Bootstrap: until one full measurement window exists, follow the
+    // capacity-derived reference directly instead of the fixed genesis value.
+    // `genesisBaseTarget` assumes a large network; on a small one it is several
+    // times too low and each block then takes minutes, so the first window
+    // would be hours away. Tracking the reference self-sizes the network
+    // immediately, and the feedback step below refines it afterwards.
+    if (height < window) {
+      const seed = ideal && ideal > 0n ? ideal : prevTarget;
+      return String(this._clampBaseTarget(seed, ideal));
+    }
+
+    if (height % window !== 0) return String(prevTarget);
+
     const oldest = this.db.prepare('SELECT timestamp FROM blocks WHERE height = ?').get(Math.max(0, height - window));
     if (!oldest) return String(prevTarget);
     const actualDuration = prev.timestamp - oldest.timestamp;
     if (actualDuration <= 0) return String(prevTarget);
 
-    const meanSeconds = Math.max(1, actualDuration / window);
-    const maxMove = Math.min(0.30, Number(this.cfg.baseTargetMaxMove ?? 0.30));
-    const ratio = meanSeconds / Math.max(0.1, expectedTime);
-    let t;
-    if (ratio > 1) {
-      const gain = Math.min(maxMove, ratio - 1);
-      t = (prevTarget * BigInt(Math.round((1 + gain) * 1000))) / 1000n;
-    } else {
-      const loss = Math.min(maxMove, 1 - ratio);
-      t = (prevTarget * BigInt(Math.round((1 - loss) * 1000))) / 1000n;
-    }
+    // Proportional step: deadline scales as 1/baseTarget, so measured/expected
+    // drives the base target straight to the target block time. Bounded per
+    // window to avoid overshoot from a noisy measurement, then clamped against
+    // the capacity reference so a noisy measurement cannot run it away.
+    const meanSeconds = actualDuration / window;
+    const maxMove = Math.min(0.9, Math.max(0.01, Number(this.cfg.baseTargetMaxMove ?? 0.5)));
+    const ratio = meanSeconds / expectedTime;
+    const factor = Math.min(1 + maxMove, Math.max(1 - maxMove, ratio));
+    const t = (prevTarget * BigInt(Math.round(factor * 1000000))) / 1000000n;
 
-    // Minimum and Max base target Possible, this make sure the network will never be so hard, or so easy (normally it increases infinitely)
-    const minB = safeBigInt(this.cfg.baseTargetMin, 2n ** 32n);
-    const maxB = safeBigInt(this.cfg.baseTargetMax, 2n ** 42n);
-    if (t < minB) t = minB;
-    if (t > maxB) t = maxB;
-    if (t < 1n) t = 1n;
-    return String(t);
+    return String(this._clampBaseTarget(t, ideal));
   }
 
   _baseFeeForHeight(height) {
@@ -1549,7 +1624,15 @@ class MemPool_Manager {
     const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(sender);
     const curNonce = user ? safeInt(user.nonce, 0) : 0;
     const curBalance = user ? safeBigInt(user.balance, 0n) : 0n;
-    if (safeInt(tx.nonce, 0) !== curNonce) return { ok: false, motivo: `invalid nonce (tx=${tx.nonce}, account=${curNonce})` };
+    // Accept the confirmed nonce or any near-future nonce: a client preparing
+    // several txs back to back (e.g. auto-registering multiple plots) hands out
+    // consecutive nonces, and nonce-gapped txs simply stay queued until their
+    // predecessors are mined. This matches the forger's sequential selection
+    // (which only drops nonces below the projected value).
+    const txNonce = safeInt(tx.nonce, 0);
+    if (txNonce < curNonce) return { ok: false, motivo: `stale nonce (tx=${txNonce}, account=${curNonce})` };
+    const maxFutureNonce = curNonce + Math.max(1, safeInt(this.cfg.maxFutureNonce, 64));
+    if (txNonce > maxFutureNonce) return { ok: false, motivo: `nonce too far in future (tx=${txNonce}, account=${curNonce})` };
     if (curBalance < safeBigInt(tx.value, 0n) + safeBigInt(tx.fee, 0n)) return { ok: false, motivo: `insufficient balance for ${sender}` };
     if (!tx.to_addr && this.chain.contracts) {
       const address = this.chain.contracts.deriveContractAddress(sender, safeInt(tx.nonce, 0));
@@ -1561,25 +1644,36 @@ class MemPool_Manager {
     const requiredGas = estimateIntrinsicGas(tx);
     if (safeInt(tx.gas_limit, 0) < requiredGas) return { ok: false, motivo: `gas_limit too low (need ${requiredGas})` };
     if (safeInt(tx.gas_limit, 0) > GAS_PARAMS.maxGasPerTx) return { ok: false, motivo: `gas_limit exceeds max per tx (${GAS_PARAMS.maxGasPerTx})` };
-    const currentBaseFee = BigInt(this.chain._baseFeeForHeight(this.chain.height + 1));
-    if (safeBigInt(tx.gas_price, 0n) < currentBaseFee) return { ok: false, motivo: `gas_price below base fee (${currentBaseFee})` };
-    const minFee = minimumFee(tx, currentBaseFee);
-    if (safeBigInt(tx.fee, 0n) < minFee) return { ok: false, motivo: `fee too low (need ${minFee} = intrinsic ${estimateIntrinsicGas(tx)} * baseFee ${currentBaseFee})` };
+    const isRegistration = PocPlotV4.isRegistrationPayload(tx.data);
+    if (!isRegistration) {
+      const currentBaseFee = BigInt(this.chain._baseFeeForHeight(this.chain.height + 1));
+      if (safeBigInt(tx.gas_price, 0n) < currentBaseFee) return { ok: false, motivo: `gas_price below base fee (${currentBaseFee})` };
+      const minFee = minimumFee(tx, currentBaseFee);
+      if (safeBigInt(tx.fee, 0n) < minFee) return { ok: false, motivo: `fee too low (need ${minFee} = intrinsic ${estimateIntrinsicGas(tx)} * baseFee ${currentBaseFee})` };
+    }
 
-    if (PocPlotV4.isRegistrationPayload(tx.data)) {
+    if (isRegistration) {
       let events;
       try { events = this.chain._preparePlotRegistrationEvents([tx], this.chain.height + 1, this.chain.bestHash); }
       catch (e) { return { ok: false, motivo: e.message || 'invalid v4 plot registration' }; }
       if (events.length !== 1) return { ok: false, motivo: 'invalid v4 plot registration transaction' };
+      const maxPerBlock = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerBlock, 4));
+      const maxPerMiner = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerMinerPerBlock, 1));
+      const senderLc = sender.toLowerCase();
       const pending = this.db.prepare('SELECT raw FROM mempool').all();
+      let pendingTotal = 0, pendingForSender = 0;
       for (const row of pending) {
         try {
           const other = JSON.parse(row.raw);
           if (!PocPlotV4.isRegistrationPayload(other.data)) continue;
+          pendingTotal++;
+          if (String(other.from_addr || '').toLowerCase() === senderLc) pendingForSender++;
           const registration = PocPlotV4.decodeRegistration(other.data);
           if (registration.plot_id === events[0].plot_id) return { ok: false, motivo: 'plot_id already has a pending registration' };
         } catch { /* malformed unrelated mempool entry */ }
       }
+      if (pendingTotal >= maxPerBlock) return { ok: false, motivo: `too many pending plot registrations (max ${maxPerBlock})` };
+      if (pendingForSender >= maxPerMiner) return { ok: false, motivo: `miner already has a pending plot registration (max ${maxPerMiner})` };
     }
 
     return { ok: true, motivo: 'valid' };
@@ -1631,116 +1725,11 @@ class contracts_Manager {
 
   _isContractOp(tx) { return this._isCreateTx(tx) || this._isContractCall(tx); }
 
-  _blockContext(bloco) {
-    try {
-      return createBlock({
-        header: {
-          timestamp: BigInt(safeInt(bloco.timestamp, 0)),
-          number: BigInt(safeInt(bloco.height, 0)),
-        },
-      });
-    } catch (e) { return undefined; }
-  }
-
-  _snapshotContractState(address) {
-    return {
-      address,
-      storage: this.db.prepare('SELECT * FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').all(address),
-      account: this.db.prepare('SELECT * FROM smart_contract_accounts WHERE lower(address) = lower(?)').get(address) || null,
-      contract: this.db.prepare('SELECT * FROM smart_contracts WHERE lower(address) = lower(?)').get(address) || null,
-    };
-  }
-
-  _restoreContractState(snaps) {
-    for (const s of snaps) {
-      this.db.prepare('DELETE FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').run(s.address);
-      this.db.prepare('DELETE FROM smart_contract_accounts WHERE lower(address) = lower(?)').run(s.address);
-      this.db.prepare('DELETE FROM smart_contracts WHERE lower(address) = lower(?)').run(s.address);
-      for (const row of s.storage) this.db.prepare('INSERT OR REPLACE INTO smart_contract_storage (contract_address, slot, value) VALUES (?,?,?)').run(row.contract_address, row.slot, row.value);
-      if (s.account) this.db.prepare('INSERT OR REPLACE INTO smart_contract_accounts (address, balance) VALUES (?,?)').run(s.account.address, s.account.balance);
-      if (s.contract) this.db.prepare('INSERT OR REPLACE INTO smart_contracts (address, creator, code, created_at, updated_at) VALUES (?,?,?,?,?)').run(s.contract.address, s.contract.creator, s.contract.code, s.contract.created_at, s.contract.updated_at);
-    }
-    if (this.chain.contracts && this.chain.contracts.clearVmCache) this.chain.contracts.clearVmCache();
-  }
-
-  _recordContractStateChanges(blockHeight, blockHash, snapshots) {
-    const now = Math.floor(Date.now() / 1000);
-    for (const snap of snapshots || []) {
-      const addr = String(snap.address || '').toLowerCase();
-      if (!addr) continue;
-      const currentStorageRows = this.db.prepare('SELECT * FROM smart_contract_storage WHERE lower(contract_address) = lower(?)').all(addr);
-      const prevStorage = new Map((snap.storage || []).map(r => [String(r.slot), (r.value == null ? '' : String(r.value))]));
-      const nextStorage = new Map(currentStorageRows.map(r => [String(r.slot), (r.value == null ? '' : String(r.value))]));
-      const slots = new Set([...prevStorage.keys(), ...nextStorage.keys()]);
-      for (const slot of slots) {
-        const prevValue = prevStorage.has(slot) ? prevStorage.get(slot) : '';
-        const newValue = nextStorage.has(slot) ? nextStorage.get(slot) : '';
-        this.db.prepare(`
-          INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
-          VALUES (?,?,?,?,?,?,?)
-        `).run(addr, slot, prevValue, newValue, blockHeight, blockHash, now);
-      }
-
-      const prevAccount = snap.account ? (snap.account.balance == null ? '' : String(snap.account.balance)) : '';
-      const nextAccountRow = this.db.prepare('SELECT * FROM smart_contract_accounts WHERE lower(address) = lower(?)').get(addr);
-      const nextAccount = nextAccountRow ? (nextAccountRow.balance == null ? '' : String(nextAccountRow.balance)) : '';
-      this.db.prepare(`
-        INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
-        VALUES (?,?,?,?,?,?,?)
-      `).run(addr, '__balance__', prevAccount, nextAccount, blockHeight, blockHash, now);
-
-      const prevContract = snap.contract ? JSON.stringify(snap.contract) : '';
-      const nextContractRow = this.db.prepare('SELECT * FROM smart_contracts WHERE lower(address) = lower(?)').get(addr);
-      const nextContract = nextContractRow ? JSON.stringify(nextContractRow) : '';
-      this.db.prepare(`
-        INSERT OR REPLACE INTO smart_contract_storage_history (contract_address, slot, prev_value, new_value, block_height, block_hash, created_at)
-        VALUES (?,?,?,?,?,?,?)
-      `).run(addr, '__contract__', prevContract, nextContract, blockHeight, blockHash, now);
-    }
-  }
-
-  _restoreContractStateFromHistory(aboveHeight) {
-    const changes = this.db.prepare('SELECT * FROM smart_contract_storage_history WHERE block_height > ? ORDER BY block_height DESC').all(aboveHeight);
-    const byContract = new Map();
-    for (const c of changes) {
-      if (!byContract.has(c.contract_address)) byContract.set(c.contract_address, []);
-      byContract.get(c.contract_address).push(c);
-    }
-    for (const [addr, chgs] of byContract) {
-      const seen = new Set();
-      for (const c of chgs) {
-        const key = c.slot;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        if (c.slot === '__contract__') {
-          if (c.prev_value === null || c.prev_value === '') {
-            this.db.prepare('DELETE FROM smart_contracts WHERE lower(address) = lower(?)').run(addr);
-          } else {
-            try {
-              const prev = JSON.parse(c.prev_value);
-              this.db.prepare('INSERT OR REPLACE INTO smart_contracts (address, creator, code, created_at, updated_at) VALUES (?,?,?,?,?)').run(prev.address, prev.creator, prev.code, prev.created_at, prev.updated_at);
-            } catch {
-              this.db.prepare('DELETE FROM smart_contracts WHERE lower(address) = lower(?)').run(addr);
-            }
-          }
-        } else if (c.slot === '__balance__') {
-          if (c.prev_value === null || c.prev_value === '') {
-            this.db.prepare('DELETE FROM smart_contract_accounts WHERE lower(address) = lower(?)').run(addr);
-          } else {
-            this.db.prepare('INSERT OR REPLACE INTO smart_contract_accounts (address, balance) VALUES (?,?)').run(addr, c.prev_value);
-          }
-        } else if (c.prev_value === null || c.prev_value === '') {
-          this.db.prepare('DELETE FROM smart_contract_storage WHERE lower(contract_address) = lower(?) AND slot = ?').run(addr, c.slot);
-        } else {
-          this.db.prepare('INSERT OR REPLACE INTO smart_contract_storage (contract_address, slot, value) VALUES (?,?,?)').run(addr, c.slot, c.prev_value);
-        }
-      }
-    }
-    this.db.prepare('DELETE FROM smart_contract_storage_history WHERE block_height > ?').run(aboveHeight);
-    if (this.chain.contracts && this.chain.contracts.clearVmCache) this.chain.contracts.clearVmCache();
-
-    this.chain.stateTrie.loadFromDB(this.db).catch(e => log('warn', `State trie reload: ${e.message}`));
-  }
+  _blockContext(bloco) { return this.chain._blockContext(bloco); }
+  _snapshotContractState(address) { return this.chain._snapshotContractState(address); }
+  _restoreContractState(snaps) { return this.chain._restoreContractState(snaps); }
+  _recordContractStateChanges(blockHeight, blockHash, snapshots) { return this.chain._recordContractStateChanges(blockHeight, blockHash, snapshots); }
+  _restoreContractStateFromHistory(aboveHeight) { return this.chain._restoreContractStateFromHistory(aboveHeight); }
 
   async _preExecuteContracts(bloco, txs) {
     const backup = [];

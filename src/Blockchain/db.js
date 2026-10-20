@@ -81,7 +81,15 @@ function initDB(dbPath, cfg) {
     CREATE TABLE IF NOT EXISTS challenge_submissions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       challenge_id TEXT, miner TEXT, plot_id TEXT, size_gb REAL,
-      deadline INTEGER, proof_digest TEXT, submitted_at INTEGER
+      deadline INTEGER, proof_digest TEXT, submitted_at INTEGER,
+      proof_signature TEXT DEFAULT "",
+      scoop_data TEXT DEFAULT "",
+      scoop_index INTEGER DEFAULT 0,
+      total_scoops INTEGER DEFAULT 0,
+      merkle_proof TEXT DEFAULT "",
+      merkle_root TEXT DEFAULT "",
+      capacity_samples TEXT DEFAULT "[]",
+      public_key TEXT DEFAULT ""
     );
     CREATE INDEX IF NOT EXISTS idx_sub_challenge ON challenge_submissions(challenge_id);
     CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline);

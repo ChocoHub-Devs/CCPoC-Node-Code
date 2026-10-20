@@ -3,10 +3,15 @@ const { safeInt, safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate 
 const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
 
+const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024; // 16 MiB
+
 function fetchJSON(url, opts = {}) {
   const u = new URL(url);
   const mod = u.protocol === 'https:' ? require('https') : require('http');
+  const maxBytes = opts.maxBytes || DEFAULT_MAX_RESPONSE_BYTES;
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
     const timeout = (opts.timeout || 10) * 1000;
     const req = mod.request(url, {
       method: opts.method || 'GET',
@@ -14,13 +19,26 @@ function fetchJSON(url, opts = {}) {
       timeout,
     }, (res) => {
       let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve(null); }
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        // Guard against peers returning an unbounded response body (DoS).
+        if (size > maxBytes) {
+          log('warn', `[P2P] Response from ${u.host} exceeded ${maxBytes} bytes; aborting`);
+          res.destroy();
+          req.destroy();
+          done(null);
+          return;
+        }
+        data += c;
       });
+      res.on('end', () => {
+        try { done(JSON.parse(data)); } catch { done(null); }
+      });
+      res.on('error', () => done(null));
     });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => done(null));
+    req.on('timeout', () => { req.destroy(); done(null); });
     if (opts.body) req.write(JSON.stringify(opts.body));
     req.end();
   });

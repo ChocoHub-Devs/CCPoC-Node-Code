@@ -632,7 +632,7 @@ function computeDeadline(scoopData, genSig, baseTarget) {
   if (baseTarget == null || baseTarget === '' || BigInt(baseTarget) <= 0n) {
     throw new Error('computeDeadline: baseTarget é obrigatório e deve ser > 0');
   }
-  const data = typeof scoopData === 'string' ? Buffer.from(scoopData, 'hex') : Buffer.isBuffer(scoopData) ? scoopData : Buffer.from(String(scoopData));
+  const data = typeof scoopData === 'string' ? Buffer.from(scoopData, 'hex') : Buffer.isBuffer(scoopData) ? scoopData : Buffer.from(String(scoopData), 'utf8');
   const sig = typeof genSig === 'string' ? genSig : (genSig && genSig.challenge_seed) || String(genSig || '');
   const quality = crypto.createHash('sha256').update(Buffer.concat([data, Buffer.from(sig)])).digest();
   const qualityInt = quality.readBigUInt64BE(0);

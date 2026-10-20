@@ -146,8 +146,12 @@ class P2PWebSocketServer {
       this._pingTimer = setInterval(() => {
         for (const ws of this.wss.clients) {
           if (!ws.isAlive) {
+            // Dead client: drop it and continue pinging the rest. Using `return`
+            // here previously aborted the whole loop, leaving remaining clients
+            // unpinned and undetected.
             this.clients.delete(ws);
-            return ws.terminate();
+            ws.terminate();
+            continue;
           }
           ws.isAlive = false;
           ws.ping();

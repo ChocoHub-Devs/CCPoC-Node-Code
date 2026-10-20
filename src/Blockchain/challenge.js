@@ -168,8 +168,28 @@ class ChallengeManager {
       projectedNonce[sender] = Math.max(projectedNonce[sender] + 1, safeInt(tx.nonce, 0) + 1);
       good.push(tx);
     }
-    log('info', `[TX] selected ${good.length} txs for block`);
-    return good;
+    // Enforce the per-block v4 plot-registration caps so the forged block stays
+    // valid; surplus registrations are left in the mempool for a later block.
+    const maxReg = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerBlock, 4));
+    const maxRegMiner = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerMinerPerBlock, 1));
+    const regPerMiner = new Map();
+    let regTotal = 0;
+    const capped = [];
+    for (const tx of good) {
+      if (PocPlotV4.isRegistrationPayload(tx && tx.data)) {
+        const sender = String(tx.from_addr || '').toLowerCase();
+        const used = regPerMiner.get(sender) || 0;
+        if (regTotal >= maxReg || used >= maxRegMiner) {
+          log('info', `[TX] deferring plot registration ${(tx.hash || '').slice(0, 12)} to a later block (registration cap)`);
+          continue;
+        }
+        regPerMiner.set(sender, used + 1);
+        regTotal++;
+      }
+      capped.push(tx);
+    }
+    log('info', `[TX] selected ${capped.length} txs for block`);
+    return capped;
   }
 
   async _forgeBlock(chain, challenge, miner, deadline, rewardDistribution = [], plotId = '', proofDigest = '', winnerProof = null) {

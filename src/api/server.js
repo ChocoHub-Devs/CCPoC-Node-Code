@@ -331,7 +331,26 @@ app.get('/api/state', (req, res) => {
         if (isNaN(amountNum) || amountNum < 0) return res.status(400).json({ error: 'invalid amount' });
         const valueWei = String(Math.round(amountNum * 1e18));
         
-        const nonce = user ? (user.nonce || 0) : 0;
+        // Next usable nonce = first value >= the confirmed nonce that no pending
+        // mempool tx from this address already occupies. Without this, a client
+        // preparing several txs in a row (e.g. auto-registering multiple plots)
+        // receives the same confirmed nonce for all of them and every tx but the
+        // first is dropped as a stale nonce at forge time.
+        const confirmedNonce = user ? (user.nonce || 0) : 0;
+        let nonce = confirmedNonce;
+        try {
+          const pending = this.db.prepare('SELECT raw FROM mempool').all();
+          const used = new Set();
+          for (const row of pending) {
+            try {
+              const t = JSON.parse(row.raw);
+              if (String(t.from_addr || '').toLowerCase() !== normalizedFrom) continue;
+              const n = Number(t.nonce);
+              if (Number.isInteger(n) && n >= confirmedNonce) used.add(n);
+            } catch { /* malformed unrelated mempool entry */ }
+          }
+          while (used.has(nonce)) nonce++;
+        } catch { /* mempool unavailable: fall back to confirmed nonce */ }
         const gasPrice = gas_price || this.chain._baseFeeForHeight(this.chain.height + 1);
         const defaultGas = hasData ? 3000000 : 21000;
         const gasLimit = gas_limit || defaultGas;
