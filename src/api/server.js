@@ -22,7 +22,7 @@ function formatCcAmount(units) {
 
 const rateLimitStore = new Map();
 function rateLimit(options = {}) {
-  const { windowMs = 600000, max = 100, keyPrefix = 'rl', message = 'Too many requests' } = options;
+  const { windowMs = 60000, max = 100, keyPrefix = 'rl', message = 'Too many requests' } = options;
   return (req, res, next) => {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
     const key = `${keyPrefix}:${ip}`;
