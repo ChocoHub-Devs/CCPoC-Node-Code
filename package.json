@@ -3,7 +3,7 @@
   "version": "3.6.0",
   "private": true,
   "engines": {
-  "node": "22.x"
+    "node": "22.x"
   },
   "bin": {
     "choco": "./chocohub.js"
@@ -23,7 +23,7 @@
     "@ethereumjs/vm": "^10.1.2",
     "@noble/curves": "^1.4.0",
     "axios": "^1.6.0",
-    "better-sqlite3": "^11.7.0",
+    "better-sqlite3": "^13.0.3",
     "bn.js": "^5.2.5",
     "ethers": "^6.13.0",
     "express": "^5.2.1",
