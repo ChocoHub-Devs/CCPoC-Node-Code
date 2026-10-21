@@ -15,7 +15,7 @@ function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; 
 
 class Config {
  static Configuration = Object.freeze({
-  FINALIZATION_DEPTH: 30,
+  FINALIZATION_DEPTH: 512,
   ANCHOR_WINDOW_SIZE: 8192,
   MAX_ENTRIES_PER_BLOCK: 256,
   MAX_BASE_TARGET: 2n ** 43n,
