@@ -168,8 +168,6 @@ class ChallengeManager {
       projectedNonce[sender] = Math.max(projectedNonce[sender] + 1, safeInt(tx.nonce, 0) + 1);
       good.push(tx);
     }
-    // Enforce the per-block v4 plot-registration caps so the forged block stays
-    // valid; surplus registrations are left in the mempool for a later block.
     const maxReg = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerBlock, 4));
     const maxRegMiner = Math.max(1, safeInt(this.cfg.maxPlotRegistrationsPerMinerPerBlock, 1));
     const regPerMiner = new Map();
