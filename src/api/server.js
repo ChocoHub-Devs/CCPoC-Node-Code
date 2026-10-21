@@ -331,6 +331,11 @@ app.get('/api/state', (req, res) => {
         if (isNaN(amountNum) || amountNum < 0) return res.status(400).json({ error: 'invalid amount' });
         const valueWei = String(Math.round(amountNum * 1e18));
         
+        // Next usable nonce = first value >= the confirmed nonce that no pending
+        // mempool tx from this address already occupies. Without this, a client
+        // preparing several txs in a row (e.g. auto-registering multiple plots)
+        // receives the same confirmed nonce for all of them and every tx but the
+        // first is dropped as a stale nonce at forge time.
         const confirmedNonce = user ? (user.nonce || 0) : 0;
         let nonce = confirmedNonce;
         try {

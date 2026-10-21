@@ -78,6 +78,16 @@ class ChocoNode {
 
     this.chain = new Chain(this.db, cfg);
     if (this.smartContracts) this.chain.setContractExecutor(this.smartContracts);
+    // Integridade do estado no startup: se o estado materializado não bate com
+    // o root comprometido no bloco do tip (node que ficou travado por um reorg
+    // antigo), reconstrói AGORA — antes de forjar ou sincronizar — para não
+    // entrar num ciclo de "state_root mismatch" rejeitando todo bloco novo.
+    try {
+      const rep = this.chain.verifyStateIntegrity();
+      if (rep.repaired) log('warn', `State integrity: rebuilt at startup (${rep.motivo})`);
+    } catch (e) {
+      log('warn', `State integrity check failed: ${e.message}`);
+    }
     this.peers = new PeerManager(this.db, cfg);
     for (const seed of (cfg.seedPeers || [])) this.peers.add(seed);
     this.challengeMgr = new ChallengeManager(this.db, this.chain, cfg);

@@ -15,7 +15,7 @@ function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; 
 
 class Config {
  static Configuration = Object.freeze({
-  FINALIZATION_DEPTH: 512,
+  FINALIZATION_DEPTH: 30,
   ANCHOR_WINDOW_SIZE: 8192,
   MAX_ENTRIES_PER_BLOCK: 256,
   MAX_BASE_TARGET: 2n ** 43n,
@@ -576,6 +576,9 @@ class Chain {
         const intrinsic = estimateIntrinsicGas(tx);
         const gasLimit = safeInt(tx.gas_limit, 0);
         if (gasLimit < intrinsic || gasLimit > GAS_PARAMS.maxGasPerTx) return { ok: false, motivo: 'invalid transaction gas_limit' };
+        // v4 plot registrations are zero-fee protocol declarations: they must be
+        // canonical zero-value txs to the zero address and are exempt from the
+        // gas_price/fee minimums (anti-spam is handled by per-block caps).
         if (PocPlotV4.isRegistrationPayload(tx.data)) continue;
         if (safeBigInt(tx.gas_price, 0n) < blockBaseFee) return { ok: false, motivo: 'transaction gas_price below base fee' };
         if (safeBigInt(tx.fee, 0n) < minimumFee(tx, blockBaseFee)) return { ok: false, motivo: 'transaction fee below minimum' };
@@ -734,6 +737,10 @@ class Chain {
         const doomed = this.getBlockByHash(existingAtHeight.hash);
         if (doomed) this._rollbackRewardsForBlock(doomed.hash);
         if (doomed) this._rollbackPayoutsForBlock(doomed.hash);
+        // Desfaz também o que as transações do bloco incumbente aplicaram em
+        // users (débito do sender, crédito do recipient, taxa do forger). Sem
+        // isso o estado fica com o efeito do bloco descartado E do bloco novo,
+        // e todo bloco seguinte falha com state_root mismatch para sempre.
         this._rollbackTxsForBlock(existingAtHeight.hash);
         this.db.prepare('DELETE FROM contract_logs WHERE block_hash = ?').run(existingAtHeight.hash);
         this.db.prepare('DELETE FROM transactions WHERE block_hash = ?').run(existingAtHeight.hash);
@@ -905,7 +912,19 @@ class Chain {
       return { ok: true, motivo: 'block added', height, hash: bloco.hash };
     } catch (e) {
       if (contractExec) { try { contractExec.rollback(); } catch {} }
-      return { ok: false, motivo: e.message || 'database error' };
+      const msg = e.message || 'database error';
+      // Autocorreção: "state_root mismatch" quase sempre significa que o NOSSO
+      // estado no tip divergiu (bug de reorg/rollback), não que o bloco seja
+      // inválido. Reconstrói a partir da cadeia e tenta de novo UMA vez. O
+      // guard _stateRepaired evita loop quando o bloco é mesmo de outro fork.
+      if (!opts._stateRepaired && /state_root mismatch|contract_state_root mismatch/.test(msg)) {
+        const rep = this.verifyStateIntegrity();
+        if (rep.repaired && rep.ok) {
+          log('warn', `estado divergiu no tip; reconstruído da cadeia (${rep.motivo}); retentando #${height}`);
+          return this.addBlock(bloco, { ...opts, _stateRepaired: true });
+        }
+      }
+      return { ok: false, motivo: msg };
     }
   }
 
@@ -1136,6 +1155,9 @@ class Chain {
       const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(r.miner);
       if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) - reward), now, r.miner);
     }
+    // Apaga as linhas também, igual a _rollbackPayoutsForBlock. Sem isso o
+    // bloco órfão continua em block_rewards e aparece na API de rewards,
+    // além de sobreviver ao dedupe por (block_height, block_hash, ...).
     this.db.prepare('DELETE FROM block_rewards WHERE block_hash = ?').run(blockHash);
   }
 
@@ -1150,6 +1172,10 @@ class Chain {
     this.db.prepare('DELETE FROM block_payouts WHERE block_hash = ?').run(hash);
   }
 
+  // Desfaz o efeito das transações de um bloco descartado. Os saldos já são
+  // reconstruídos por _recomputeBalances no fim do reorg, mas o forceSync
+  // acontece antes disso e precisa deixar um estado coerente; o nonce depende
+  // desta reversão porque o recompute só mexe em users presentes na cadeia.
   _rollbackTxsForBlock(hash) {
     const rows = this.db.prepare('SELECT from_addr, to_addr, value, fee, data, nonce FROM transactions WHERE block_hash = ?').all(hash);
     if (!rows.length) return;
@@ -1159,14 +1185,17 @@ class Chain {
       const to = tx.to_addr ? String(tx.to_addr).toLowerCase() : '';
       if (from) {
         const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(from);
+        // Devolve valor + taxa ao remetente, espelhando a subtração de addBlock.
         if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?')
           .run(String(safeBigInt(cur.balance, 0n) + safeBigInt(tx.value, 0n) + safeBigInt(tx.fee, 0n)), now, from);
       }
+      // Mesmo critério de creditRecipient em addBlock: não credita em chamada de contrato.
       if (to && !this._isContractCall(tx)) {
         const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(to);
         if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?')
           .run(String(safeBigInt(cur.balance, 0n) - safeBigInt(tx.value, 0n)), now, to);
       }
+      // Rebaixa o nonce do remetente para o valor que a assinatura exigia.
       if (from) {
         const cur = this.db.prepare('SELECT nonce FROM users WHERE address = ?').get(from);
         if (cur && safeInt(cur.nonce, 0) > safeInt(tx.nonce, 0)) {
@@ -1208,60 +1237,96 @@ class Chain {
     }
     this._selectTip();
   }
- 
+
+  // Replay FIEL da cadeia canônica. O estado é função pura dos blocos, então
+  // reconstruir = aplicar genesis->tip com as MESMAS regras do addBlock:
+  //   1) rewards  -> credita; se a conta não existe, cria com nonce 0
+  //   2) txs      -> debita/avança nonce SÓ se o remetente JÁ existe; crédito ao
+  //                  destinatário cria a conta com nonce 0
+  //   3) payouts  -> payout de contrato + taxas ao forger, idem (cria se não existe)
+  // A versão anterior acumulava mapas fora de ordem e sem a semântica de
+  // "conta existe", o que inflava nonces — ex.: contas de registro de plot, cujas
+  // txs têm to=0x0/value=0 e não devem avançar nonce. Isso mudava computeStateRoot
+  // a cada reorg e travava o node com "state_root mismatch" para sempre.
   _recomputeBalances() {
     const hashes = [];
-    let h = this.db.prepare('SELECT hash, parent_hash, height, reward_cc, miner FROM blocks WHERE hash = ?').get(this.bestHash);
-    while (h) {
-      hashes.push(h);
-      if (h.height === 0) break;
-      h = this.db.prepare('SELECT hash, parent_hash, height, reward_cc, miner FROM blocks WHERE hash = ?').get(h.parent_hash);
-    }
-    const norm = (a) => (a ? String(a).toLowerCase() : '');
-    const bal = {};
-    const nonces = {};
+    let h = this.db.prepare('SELECT hash, parent_hash, height FROM blocks WHERE hash = ?').get(this.bestHash);
+    while (h) { hashes.push(h); if (h.height === 0) break; h = this.db.prepare('SELECT hash, parent_hash, height FROM blocks WHERE hash = ?').get(h.parent_hash); }
+    hashes.reverse(); // genesis -> tip, a mesma ordem em que o estado foi construído
+    const state = new Map(); // address -> { balance: BigInt, nonce: number }
+    const get = (a) => state.get(a);
     for (const b of hashes) {
-      const rewards = this.db.prepare('SELECT miner, reward_cc FROM block_rewards WHERE block_height = ? AND block_hash = ?').all(b.height, b.hash);
-      for (const r of rewards) {
+      // (1) rewards
+      for (const r of this.db.prepare('SELECT miner, reward_cc FROM block_rewards WHERE block_height = ? AND block_hash = ?').all(b.height, b.hash)) {
         const reward = BigInt(r.reward_cc || '0');
-        const m = norm(r.miner);
-        if (reward > 0n && m && m !== 'genesis') bal[m] = (bal[m] || 0n) + reward;
+        const m = r.miner ? String(r.miner) : '';
+        if (reward <= 0n || !m || m === 'genesis') continue;
+        const s = get(m);
+        if (s) s.balance += reward;
+        else state.set(m, { balance: reward, nonce: 0 });
       }
-      const payouts = this.db.prepare('SELECT to_addr, value FROM block_payouts WHERE block_hash = ?').all(b.hash);
-      for (const p of payouts) {
-        const to = norm(p.to_addr);
-        if (to) bal[to] = (bal[to] || 0n) + BigInt(p.value || 0);
-      }
-      const txs = this.db.prepare('SELECT from_addr, to_addr, value, fee, nonce, data FROM transactions WHERE block_hash = ?').all(b.hash);
-      for (const tx of txs) {
-        const from = norm(tx.from_addr);
-        const to = norm(tx.to_addr);
+      // (2) transactions (ordem de inserção = ordem em que foram aplicadas)
+      for (const tx of this.db.prepare('SELECT from_addr, to_addr, value, fee, nonce, data FROM transactions WHERE block_hash = ? ORDER BY rowid').all(b.hash)) {
+        const from = tx.from_addr ? String(tx.from_addr) : '';
+        const to = tx.to_addr ? String(tx.to_addr) : '';
         if (from) {
-          bal[from] = (bal[from] || 0n) - BigInt(tx.value || 0) - BigInt(tx.fee || 0);
-          nonces[from] = Math.max(nonces[from] || 0, safeInt(tx.nonce, 0) + 1);
+          const s = get(from);
+          if (s) {
+            s.balance -= BigInt(tx.value || 0) + BigInt(tx.fee || 0);
+            s.nonce = Math.max(s.nonce + 1, safeInt(tx.nonce, 0) + 1);
+          }
         }
         if (to && !this._isContractCall(tx)) {
-          bal[to] = (bal[to] || 0n) + BigInt(tx.value || 0);
+          const s = get(to);
+          if (s) s.balance += BigInt(tx.value || 0);
+          else state.set(to, { balance: BigInt(tx.value || 0), nonce: 0 });
         }
+      }
+      // (3) payouts (contrato + taxas ao forger)
+      for (const p of this.db.prepare('SELECT to_addr, value FROM block_payouts WHERE block_hash = ?').all(b.hash)) {
+        const to = p.to_addr ? String(p.to_addr) : '';
+        if (!to) continue;
+        const s = get(to);
+        if (s) s.balance += BigInt(p.value || 0);
+        else state.set(to, { balance: BigInt(p.value || 0), nonce: 0 });
       }
     }
     const now = Math.floor(Date.now() / 1000);
     const updBal = this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?');
     const updNonce = this.db.prepare('UPDATE users SET nonce = ?, updated_at = ? WHERE address = ?');
-    const all = this.db.prepare('SELECT address, balance, nonce FROM users').all();
-    for (const u of all) {
-      const key = norm(u.address);
-      const expected = bal[key];
-      if (expected === undefined) continue;
-      if (String(expected) !== u.balance) updBal.run(String(expected), now, u.address);
-      const wantNonce = nonces[key] || 0;
-      if (safeInt(u.nonce, 0) !== wantNonce) updNonce.run(wantNonce, now, u.address);
+    for (const u of this.db.prepare('SELECT address, balance, nonce FROM users').all()) {
+      const s = get(String(u.address));
+      // Sem atividade na cadeia canônica: não mexe (não apaga saldo de snapshot).
+      if (!s) continue;
+      if (String(s.balance) !== u.balance) updBal.run(String(s.balance), now, u.address);
+      if (safeInt(u.nonce, 0) !== s.nonce) updNonce.run(s.nonce, now, u.address);
     }
-    for (const [addr, expected] of Object.entries(bal)) {
+    for (const [addr, s] of state) {
       if (!this.db.prepare('SELECT 1 FROM users WHERE address = ?').get(addr)) {
-        this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(addr, String(expected), nonces[addr] || 0, now, now);
+        this.db.prepare('INSERT OR IGNORE INTO users (address, balance, nonce, created_at, updated_at) VALUES (?,?,?,?,?)').run(addr, String(s.balance), s.nonce, now, now);
       }
     }
+  }
+
+  // O estado (users + contratos) é função pura da cadeia canônica: dado o
+  // mesmo conjunto de blocos, todo node chega ao mesmo state_root. Portanto,
+  // se o root materializado não bate com o root comprometido no bloco do tip,
+  // o estado divergiu por bug de reorg/rollback — e reconstruir é seguro,
+  // determinístico e idempotente. Sem isto o node fica travado para sempre:
+  // nenhum bloco novo valida e nada volta a derivar o estado da cadeia.
+  verifyStateIntegrity() {
+    const tip = this.getBlock(this.height);
+    if (!tip) return { ok: true, repaired: false, motivo: 'sem tip' };
+    const before = computeStateRoot(this.db);
+    const claimed = tip.state_root || '';
+    if (!claimed || before === claimed) return { ok: true, repaired: false, motivo: 'estado consistente' };
+    this.db.transaction(() => { this._recomputeBalances(); })();
+    const after = computeStateRoot(this.db);
+    return {
+      ok: after === claimed,
+      repaired: before !== after,
+      motivo: `#${tip.height} ${before.slice(0, 12)}… -> ${after.slice(0, 12)}… (esperado ${claimed.slice(0, 12)}…)`,
+    };
   }
 
   async _insertBlockDirect(blk) {
@@ -1430,6 +1495,7 @@ class Diff_Manager {
     const latest = this.db.prepare('SELECT timestamp FROM blocks WHERE height = ?').get(height - 1);
     if (prevInterval && latest) {
       const actual = latest.timestamp - prevInterval.timestamp;
+      // actual is the timespan of (interval) blocks, not a single block
       const expectedSpan = expected * interval;
       const target = BigInt(this._targetForHeight(height - 1));
       if (actual < expectedSpan / 2) return target * 2n;
@@ -1476,6 +1542,10 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(blockTime));
   }
 
+  // Capacity-derived reference base target for a block at `height`: the value
+  // that makes the expected best deadline of every mature registration match
+  // `expectedTimePerBlock`. Pure function of the chain up to `height - 1`
+  // (explicit parent lookup, not this.height), so all nodes agree.
   _baseTargetIdealFor(height) {
     const expectedTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
     let candidates = 0n;
@@ -1489,6 +1559,8 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(expectedTime));
   }
 
+  // Clamp a candidate base target: keep it within a generous, scale-free factor
+  // of the capacity-derived reference, then inside [baseTargetMin, baseTargetMax].
   _clampBaseTarget(value, ideal) {
     let t = value;
     if (ideal && ideal > 0n) {
@@ -1513,8 +1585,19 @@ class Diff_Manager {
     if (!prev) return this._defaultBaseTarget();
     const prevTarget = BigInt((prev && prev.base_target) || this._defaultBaseTarget());
     const ideal = this._baseTargetIdealFor(height);
+
+    // Re-evaluate at most once per window; between windows the base target is
+    // frozen. The old code applied a +/-30% step to *every* block, which
+    // compounded into an exponential runaway and drove the base target down to
+    // an un-mineable floor whenever the miner was faster than the target.
     const window = Math.max(8, safeInt(this.cfg.baseTargetWindow, 128));
 
+    // Bootstrap: until one full measurement window exists, follow the
+    // capacity-derived reference directly instead of the fixed genesis value.
+    // `genesisBaseTarget` assumes a large network; on a small one it is several
+    // times too low and each block then takes minutes, so the first window
+    // would be hours away. Tracking the reference self-sizes the network
+    // immediately, and the feedback step below refines it afterwards.
     if (height < window) {
       const seed = ideal && ideal > 0n ? ideal : prevTarget;
       return String(this._clampBaseTarget(seed, ideal));
@@ -1526,7 +1609,11 @@ class Diff_Manager {
     if (!oldest) return String(prevTarget);
     const actualDuration = prev.timestamp - oldest.timestamp;
     if (actualDuration <= 0) return String(prevTarget);
-   
+
+    // Proportional step: deadline scales as 1/baseTarget, so measured/expected
+    // drives the base target straight to the target block time. Bounded per
+    // window to avoid overshoot from a noisy measurement, then clamped against
+    // the capacity reference so a noisy measurement cannot run it away.
     const meanSeconds = actualDuration / window;
     const maxMove = Math.min(0.9, Math.max(0.01, Number(this.cfg.baseTargetMaxMove ?? 0.5)));
     const ratio = meanSeconds / expectedTime;
@@ -1630,6 +1717,11 @@ class MemPool_Manager {
     const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(sender);
     const curNonce = user ? safeInt(user.nonce, 0) : 0;
     const curBalance = user ? safeBigInt(user.balance, 0n) : 0n;
+    // Accept the confirmed nonce or any near-future nonce: a client preparing
+    // several txs back to back (e.g. auto-registering multiple plots) hands out
+    // consecutive nonces, and nonce-gapped txs simply stay queued until their
+    // predecessors are mined. This matches the forger's sequential selection
+    // (which only drops nonces below the projected value).
     const txNonce = safeInt(tx.nonce, 0);
     if (txNonce < curNonce) return { ok: false, motivo: `stale nonce (tx=${txNonce}, account=${curNonce})` };
     const maxFutureNonce = curNonce + Math.max(1, safeInt(this.cfg.maxFutureNonce, 64));
