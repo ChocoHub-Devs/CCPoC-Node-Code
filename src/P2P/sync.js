@@ -22,6 +22,7 @@ function fetchJSON(url, opts = {}) {
       let size = 0;
       res.on('data', (c) => {
         size += c.length;
+        // Guard against peers returning an unbounded response body (DoS).
         if (size > maxBytes) {
           log('warn', `[P2P] Response from ${u.host} exceeded ${maxBytes} bytes; aborting`);
           res.destroy();
@@ -243,6 +244,10 @@ class SyncEngine {
           continue;
         }
         block._from_local_forge = false;
+        // The peer tip was compared against our local tip above. Intermediate
+        // blocks on that already-selected heavier branch can have equal work
+        // to the incumbent at the same height; do not apply the final fork
+        // choice independently to each prefix block.
         let res = await this.chain.addBlock(block, {
           forceSync: true,
           allowIntermediateEqualWork: true,
