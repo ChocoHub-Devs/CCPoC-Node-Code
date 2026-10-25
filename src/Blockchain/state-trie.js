@@ -295,8 +295,8 @@ class IncrementalStateRoot {
   }
 
   reloadFromDB(db) {
-    // Rebuild from the materialized database, rather than merging into the
-    // previous trie. A reorg can remove accounts, storage slots, or contracts.
+    
+    
     this.userTrie = new SparseMerkleTrie();
     this.contractStorageTrie = new SparseMerkleTrie();
     this.contractAccountTrie = new SparseMerkleTrie();

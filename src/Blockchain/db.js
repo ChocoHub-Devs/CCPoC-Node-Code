@@ -153,8 +153,8 @@ function initDB(dbPath, cfg) {
     `).run();
   } catch (e) {}
 
-  try { db.prepare('DELETE FROM block_rewards WHERE rowid NOT IN (SELECT MIN(rowid) FROM block_rewards GROUP BY block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) { /* nothing to clean */ }
-  try { db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_block_rewards ON block_rewards (block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) { /* duplicates present, skipped */ }
+  try { db.prepare('DELETE FROM block_rewards WHERE rowid NOT IN (SELECT MIN(rowid) FROM block_rewards GROUP BY block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) {   }
+  try { db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_block_rewards ON block_rewards (block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) {   }
 
   try {
     db.prepare(`
@@ -268,7 +268,7 @@ function initDB(dbPath, cfg) {
     db.prepare('CREATE INDEX IF NOT EXISTS idx_contract_logs_height ON contract_logs(block_height)').run();
     db.prepare('CREATE INDEX IF NOT EXISTS idx_contract_logs_address ON contract_logs(address)').run();
     db.prepare('CREATE INDEX IF NOT EXISTS idx_contract_logs_tx_hash ON contract_logs(tx_hash)').run();
-  } catch (e) { /* table likely exists */ }
+  } catch (e) {   }
 
   try {
     db.exec(`
@@ -280,7 +280,7 @@ function initDB(dbPath, cfg) {
       )
     `);
     db.prepare('CREATE INDEX IF NOT EXISTS idx_zkp_proofs_end ON zkp_proofs(end_height)').run();
-  } catch (e) { /* table likely exists */ }
+  } catch (e) {   }
   try { db.prepare('ALTER TABLE zkp_proofs ADD COLUMN interval_start_height INTEGER').run(); } catch {}
   try { db.prepare('ALTER TABLE zkp_proofs ADD COLUMN interval_end_height INTEGER').run(); } catch {}
 
@@ -298,7 +298,7 @@ function initDB(dbPath, cfg) {
       )
     `);
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_state_root ON snapshots(state_root)').run();
-  } catch (e) { /* table likely exists */ }
+  } catch (e) {   }
 
   require('./contract-journal').ensureContractJournalSchema(db);
   return db;

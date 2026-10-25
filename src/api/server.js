@@ -108,7 +108,7 @@ class Server {
         local: { plots_count: st.plots_count || 0, capacity_gb: Number(st.capacity_gb) || 0 },
         fetched_at: Date.now(),
       };
-    } catch (e) { /* noop */ }
+    } catch (e) {   }
   }
 
   start() {
@@ -136,9 +136,9 @@ class Server {
 
     app.use(express.static(PUBLIC_DIR, { maxAge: 0 }));
 
-    // Reorg replay temporarily rewinds and rebuilds the canonical tables inside
-    // one SQLite transaction. Keep API and JSON-RPC readers from observing that
-    // in-flight state; block submission/forging must remain able to finish it.
+    
+    
+    
     app.use((req, res, next) => {
       if ((req.method === 'POST' && (req.path === '/api/node/broadcast/block' || req.path === '/api/node/forge'))
         || req.path === '/health' || req.path === '/health/liveness' || req.path === '/health/readiness') {
@@ -368,11 +368,11 @@ app.get('/api/state', (req, res) => {
         if (isNaN(amountNum) || amountNum < 0) return res.status(400).json({ error: 'invalid amount' });
         const valueWei = String(Math.round(amountNum * 1e18));
         
-        // Next usable nonce = first value >= the confirmed nonce that no pending
-        // mempool tx from this address already occupies. Without this, a client
-        // preparing several txs in a row (e.g. auto-registering multiple plots)
-        // receives the same confirmed nonce for all of them and every tx but the
-        // first is dropped as a stale nonce at forge time.
+        
+        
+        
+        
+        
         const confirmedNonce = user ? (user.nonce || 0) : 0;
         let nonce = confirmedNonce;
         try {
@@ -384,10 +384,10 @@ app.get('/api/state', (req, res) => {
               if (String(t.from_addr || '').toLowerCase() !== normalizedFrom) continue;
               const n = Number(t.nonce);
               if (Number.isInteger(n) && n >= confirmedNonce) used.add(n);
-            } catch { /* malformed unrelated mempool entry */ }
+            } catch {   }
           }
           while (used.has(nonce)) nonce++;
-        } catch { /* mempool unavailable: fall back to confirmed nonce */ }
+        } catch {   }
         const gasPrice = gas_price || this.chain._baseFeeForHeight(this.chain.height + 1);
         const defaultGas = hasData ? 3000000 : 21000;
         const gasLimit = gas_limit || defaultGas;
@@ -714,8 +714,11 @@ const validation = await this.chain.validateTxForMempool(tx);
     app.post('/api/node/broadcast/block', syncLimiter, async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
+      const startedAt = Date.now();
+      const transferBytes = Buffer.byteLength(JSON.stringify(block));
+      log('debug', `[P2P] received HTTP block height=${block.height} hash=${String(block.hash || '').slice(0, 12)} txs=${Array.isArray(block.transactions) ? block.transactions.length : 0} bytes=${transferBytes}`);
       let result = await this.chain.addBlock(block);
-      log('info', `[P2P] broadcast block h=${block.height} hash=${(block.hash || '').slice(0, 10)} result=${result.motivo} height=${this.chain.height}`);
+      log('debug', `[P2P] HTTP block result=${result.ok ? 'accepted' : 'rejected'} height=${block.height} hash=${String(block.hash || '').slice(0, 12)} reason=${result.motivo || 'ok'} local_height=${this.chain.height} duration_ms=${Date.now() - startedAt}`);
       res.json(result);
     });
 
@@ -806,7 +809,7 @@ const validation = await this.chain.validateTxForMempool(tx);
 
     let port = this.cfg.port;
 
-    // ========= ETHEREUM JSON RPC ENDPOINTS HERE! ==============
+    
     
     try {
       const { EthereumRPC } = require('../json-rpc/ethereum-rpc');

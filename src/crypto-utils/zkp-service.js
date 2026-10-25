@@ -57,7 +57,7 @@ class ZkpService {
     const out = zkp.verifyInterval(proof);
     try {
       this.db.prepare('UPDATE zkp_proofs SET verified = ? WHERE id = ?').run(out.valid ? 1 : 0, id);
-    } catch (e) { /* non-fatal */ }
+    } catch (e) {   }
     return out;
   }
 

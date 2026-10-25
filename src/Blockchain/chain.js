@@ -41,16 +41,16 @@ class Chain {
     this.contractJournal = new ContractJournal(db, snapshots => this._restoreContractState(snapshots));
     this.contractJournal.recover();
 
-    try { this.db.prepare('ALTER TABLE transactions ADD COLUMN block_hash TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN base_target TEXT').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN contract_state_root TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN forger TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare("ALTER TABLE blocks ADD COLUMN rewards_json TEXT DEFAULT '[]'").run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN body_pruned INTEGER DEFAULT 0').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare("ALTER TABLE blocks ADD COLUMN chain_id TEXT DEFAULT ''").run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE transactions ADD COLUMN data TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE challenge_submissions ADD COLUMN capacity_samples TEXT DEFAULT "[]"').run(); } catch (e) { /* already exists */ }
-    try { this.db.prepare('ALTER TABLE challenge_submissions ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
+    try { this.db.prepare('ALTER TABLE transactions ADD COLUMN block_hash TEXT DEFAULT ""').run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN base_target TEXT').run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN contract_state_root TEXT DEFAULT ""').run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN forger TEXT DEFAULT ""').run(); } catch (e) {   }
+    try { this.db.prepare("ALTER TABLE blocks ADD COLUMN rewards_json TEXT DEFAULT '[]'").run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE blocks ADD COLUMN body_pruned INTEGER DEFAULT 0').run(); } catch (e) {   }
+    try { this.db.prepare("ALTER TABLE blocks ADD COLUMN chain_id TEXT DEFAULT ''").run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE transactions ADD COLUMN data TEXT DEFAULT ""').run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE challenge_submissions ADD COLUMN capacity_samples TEXT DEFAULT "[]"').run(); } catch (e) {   }
+    try { this.db.prepare('ALTER TABLE challenge_submissions ADD COLUMN public_key TEXT DEFAULT ""').run(); } catch (e) {   }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS plot_registration_events (
         block_hash TEXT NOT NULL,
@@ -75,12 +75,12 @@ class Chain {
     this._assertGenesisMatchesConfig();
     this._backfillPlotRegistrationEvents();
     this.stateTrieLoadPromise = this.stateTrie.loadFromDB(this.db).catch(e => log('warn', `State trie init: ${e.message}`));
-    try { this.db.prepare('DELETE FROM block_rewards WHERE rowid NOT IN (SELECT MIN(rowid) FROM block_rewards GROUP BY block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) { /* nothing to clean */ }
-    try { this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_block_rewards ON block_rewards (block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) { /* duplicates present, skipped */ }
+    try { this.db.prepare('DELETE FROM block_rewards WHERE rowid NOT IN (SELECT MIN(rowid) FROM block_rewards GROUP BY block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) {   }
+    try { this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_block_rewards ON block_rewards (block_height, block_hash, miner, plot_id, reward_cc)').run(); } catch (e) {   }
     const repFix = (t) => { const rows = this.db.prepare(`SELECT block_height, block_hash FROM ${t}`).all(); for (const r of rows) { const blks = this.db.prepare('SELECT hash FROM blocks WHERE height = ?').all(r.block_height); if (blks.length === 1 && blks[0].hash !== r.block_hash) this.db.prepare(`UPDATE ${t} SET block_hash = ? WHERE block_height = ? AND block_hash = ?`).run(blks[0].hash, r.block_height, r.block_hash); } };
-    try { repFix('block_rewards'); repFix('transactions'); } catch (e) { /* table missing */ }
-    try { this.db.prepare('DELETE FROM challenge_submissions WHERE id NOT IN (SELECT MIN(id) FROM challenge_submissions GROUP BY challenge_id, miner, plot_id, deadline)').run(); } catch (e) { /* nothing to clean */ }
-    try { this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline)').run(); } catch (e) { /* duplicates present, skipped */ }
+    try { repFix('block_rewards'); repFix('transactions'); } catch (e) {   }
+    try { this.db.prepare('DELETE FROM challenge_submissions WHERE id NOT IN (SELECT MIN(id) FROM challenge_submissions GROUP BY challenge_id, miner, plot_id, deadline)').run(); } catch (e) {   }
+    try { this.db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline)').run(); } catch (e) {   }
     try { this.zkp = new ZkpService(this.db, this.cfg); } catch (e) { log('warn', `ZKP service init: ${e.message}`); this.zkp = null; }
     try {
       this.snapsync = new SnapSyncService(this.db, this.cfg);
@@ -347,13 +347,13 @@ class Chain {
             || BigInt(tx.value || '0') !== 0n
             || String(tx.chain_id) !== String(this.cfg.chainId)) continue;
           insert.run(tx.block_hash, tx.block_height, tx.from_addr, reg.plot_id, reg.merkle_root, reg.capacity_bytes, tx.hash);
-        } catch { /* historical ordinary transactions are not registration events */ }
+        } catch {   }
       }
     });
     save();
   }
 
-  // ================== Diff Manager things ==================================
+  
   _targetForHeight(height, parentHash) { return this.diffManager._targetForHeight(height, parentHash); }
   _blockWork(block) { return this.diffManager._blockWork(block); }
   _defaultBaseTarget() { return this.diffManager._defaultBaseTarget(); }
@@ -361,7 +361,7 @@ class Chain {
   _baseTargetForHeight(height, parentHash) { return this.diffManager._baseTargetForHeight(height, parentHash); }
   _baseFeeForHeight(height, parentHash) { return this.diffManager._baseFeeForHeight(height, parentHash); }
 
-  // ================== Mempool Manager things ==================================
+  
   _validateTxOrder(txs) { return this.mempoolManager._validateTxOrder(txs); }
   _validateTxBalances(txs) { return this.mempoolManager._validateTxBalances(txs); }
   _txRootMatches(bloco) {
@@ -375,7 +375,7 @@ class Chain {
   getMempoolForBlock(maxCount = 100) { return this.mempoolManager.getMempoolForBlock(maxCount); }
   cleanMempool() { return this.mempoolManager.cleanMempool(); }
 
-  // ================== Contracts Manager things ==================================
+  
   _isContractCall(tx) { return this.contractsManager._isContractCall(tx); }
   _isContractOp(tx) { return this.contractsManager._isContractOp(tx); }
   async _preExecuteContracts(bloco, txs, beforeWrite) { return this.contractsManager._preExecuteContracts(bloco, txs, beforeWrite); }
@@ -484,7 +484,7 @@ class Chain {
       }
       delete bloco.rewards_json;
       if (typeof bloco.winner_proof === 'string' && bloco.winner_proof.startsWith('{')) {
-        try { bloco.winner_proof = JSON.parse(bloco.winner_proof); } catch { /* keep raw string */ }
+        try { bloco.winner_proof = JSON.parse(bloco.winner_proof); } catch {   }
       } else if (bloco.winner_proof == null) {
         bloco.winner_proof = null;
       }
@@ -594,9 +594,9 @@ class Chain {
     if (Array.isArray(bloco.rewards)) bloco.rewards.forEach(r => { if (r.miner) r.miner = normalizeAddr(r.miner); });
     const incumbentAtHeight = this.db.prepare('SELECT hash FROM blocks WHERE height = ?').get(height);
     if (incumbentAtHeight && incumbentAtHeight.hash !== bloco.hash && !opts._reorgInternal && !isLocalForge) {
-      // Do not validate a competing block against the incumbent branch's
-      // balances/nonces. reorganize() first restores the common ancestor, then
-      // validates and applies this candidate against that branch state.
+      
+      
+      
       const reorgResult = await this.reorganize(bloco, false, opts.allowVotedTie, [bloco], true);
       if (reorgResult.ok) return { ...reorgResult, motivo: 'reorganized to better tip' };
       return { ok: false, motivo: `competing block rejected: ${reorgResult.motivo}` };
@@ -655,9 +655,9 @@ class Chain {
         const intrinsic = estimateIntrinsicGas(tx);
         const gasLimit = safeInt(tx.gas_limit, 0);
         if (gasLimit < intrinsic || gasLimit > GAS_PARAMS.maxGasPerTx) return { ok: false, motivo: 'invalid transaction gas_limit' };
-        // v4 plot registrations are zero-fee protocol declarations: they must be
-        // canonical zero-value txs to the zero address and are exempt from the
-        // gas_price/fee minimums (anti-spam is handled by per-block caps).
+        
+        
+        
         if (PocPlotV4.isRegistrationPayload(tx.data)) continue;
         if (maximumGasPrice(tx, 0n) < blockBaseFee) return { ok: false, motivo: 'transaction gas price cap below base fee' };
       if (safeBigInt(tx.fee, 0n) < minimumFee(tx, blockBaseFee)) return { ok: false, motivo: 'transaction fee cap below gas_limit * gas_price' };
@@ -1038,8 +1038,8 @@ class Chain {
   }
 
   _recordContractStateChanges(blockHeight, blockHash, snapshots) {
-    // Multiple calls can touch one contract in a block. Keep the first undo
-    // value for that block while refreshing its final value on later snapshots.
+    
+    
     const now = Math.floor(Date.now() / 1000);
     for (const snap of snapshots || []) {
       const addr = String(snap.address || '').toLowerCase();
@@ -1098,8 +1098,8 @@ class Chain {
         byContract.get(c.contract_address).push(c);
       }
       for (const [addr, chgs] of byContract) {
-        // Undo every discarded block in reverse order. Skipping repeated slots
-        // would leave the state just before the latest write, not at the ancestor.
+        
+        
         for (const c of chgs) {
           if (c.slot === '__contract__') {
             if (c.prev_value === null || c.prev_value === '') {
@@ -1219,9 +1219,9 @@ class Chain {
       if (!oldTip) return { ok: false, motivo: 'old tip not found' };
       if (target.hash === oldTip.hash) return { ok: true, motivo: 'already at tip', height: this.height, hash: this.bestHash };
 
-      // Record the active chain before touching state. The first new block must
-      // attach to one of these ancestors; heights alone are not sufficient when
-      // several forks have blocks at the same height.
+      
+      
+      
       const activeByHash = new Map();
       let ancestor = oldTip;
       while (ancestor) {
@@ -1277,9 +1277,9 @@ class Chain {
       const trieSnapshot = this.stateTrie.snapshot();
       let transactionOpen = false;
       try {
-        // Keep the database transition atomic. addBlock uses nested SQLite
-        // transactions (savepoints), so no partially applied branch is visible
-        // after a validation or execution failure.
+        
+        
+        
         this.db.exec('BEGIN IMMEDIATE');
         transactionOpen = true;
 
@@ -1391,9 +1391,9 @@ class Chain {
       const cur = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(r.miner);
       if (cur) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(BigInt(cur.balance || 0) - reward), now, r.miner);
     }
-    // Apaga as linhas também, igual a _rollbackPayoutsForBlock. Sem isso o
-    // bloco órfão continua em block_rewards e aparece na API de rewards,
-    // além de sobreviver ao dedupe por (block_height, block_hash, ...).
+    
+    
+    
     this.db.prepare('DELETE FROM block_rewards WHERE block_hash = ?').run(blockHash);
   }
 
@@ -1408,25 +1408,25 @@ class Chain {
     this.db.prepare('DELETE FROM block_payouts WHERE block_hash = ?').run(hash);
   }
 
-  // Replay FIEL da cadeia canônica. O estado é função pura dos blocos, então
-  // reconstruir = aplicar genesis->tip com as MESMAS regras do addBlock:
-  //   1) rewards  -> credita; se a conta não existe, cria com nonce 0
-  //   2) txs      -> debita/avança nonce SÓ se o remetente JÁ existe; crédito ao
-  //                  destinatário cria a conta com nonce 0
-  //   3) payouts  -> payout de contrato + taxas ao forger, idem (cria se não existe)
-  // A versão anterior acumulava mapas fora de ordem e sem a semântica de
-  // "conta existe", o que inflava nonces — ex.: contas de registro de plot, cujas
-  // txs têm to=0x0/value=0 e não devem avançar nonce. Isso mudava computeStateRoot
-  // a cada reorg e travava o node com "state_root mismatch" para sempre.
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   _recomputeBalances() {
     const hashes = [];
     let h = this.db.prepare('SELECT hash, parent_hash, height FROM blocks WHERE hash = ?').get(this.bestHash);
     while (h) { hashes.push(h); if (h.height === 0) break; h = this.db.prepare('SELECT hash, parent_hash, height FROM blocks WHERE hash = ?').get(h.parent_hash); }
-    hashes.reverse(); // genesis -> tip, a mesma ordem em que o estado foi construído
-    const state = new Map(); // address -> { balance: BigInt, nonce: number }
+    hashes.reverse(); 
+    const state = new Map(); 
     const get = (a) => state.get(a);
     for (const b of hashes) {
-      // (1) rewards
+      
       for (const r of this.db.prepare('SELECT miner, reward_cc FROM block_rewards WHERE block_height = ? AND block_hash = ?').all(b.height, b.hash)) {
         const reward = BigInt(r.reward_cc || '0');
         const m = r.miner ? String(r.miner) : '';
@@ -1435,7 +1435,7 @@ class Chain {
         if (s) s.balance += reward;
         else state.set(m, { balance: reward, nonce: 0 });
       }
-      // (2) transactions (ordem de inserção = ordem em que foram aplicadas)
+      
       for (const tx of this.db.prepare('SELECT from_addr, to_addr, value, fee, nonce, data, receipt_status FROM transactions WHERE block_hash = ? ORDER BY rowid').all(b.hash)) {
         const from = tx.from_addr ? String(tx.from_addr) : '';
         const to = tx.to_addr ? String(tx.to_addr) : '';
@@ -1453,7 +1453,7 @@ class Chain {
           else state.set(to, { balance: BigInt(tx.value || 0), nonce: 0 });
         }
       }
-      // (3) payouts (contrato + taxas ao forger)
+      
       for (const p of this.db.prepare('SELECT to_addr, value FROM block_payouts WHERE block_hash = ?').all(b.hash)) {
         const to = p.to_addr ? String(p.to_addr) : '';
         if (!to) continue;
@@ -1467,7 +1467,7 @@ class Chain {
     const updNonce = this.db.prepare('UPDATE users SET nonce = ?, updated_at = ? WHERE address = ?');
     for (const u of this.db.prepare('SELECT address, balance, nonce FROM users').all()) {
       const s = get(String(u.address));
-      // Sem atividade na cadeia canônica: não mexe (não apaga saldo de snapshot).
+      
       if (!s) continue;
       if (String(s.balance) !== u.balance) updBal.run(String(s.balance), now, u.address);
       if (safeInt(u.nonce, 0) !== s.nonce) updNonce.run(s.nonce, now, u.address);
@@ -1479,12 +1479,12 @@ class Chain {
     }
   }
 
-  // O estado (users + contratos) é função pura da cadeia canônica: dado o
-  // mesmo conjunto de blocos, todo node chega ao mesmo state_root. Portanto,
-  // se o root materializado não bate com o root comprometido no bloco do tip,
-  // o estado divergiu por bug de reorg/rollback — e reconstruir é seguro,
-  // determinístico e idempotente. Sem isto o node fica travado para sempre:
-  // nenhum bloco novo valida e nada volta a derivar o estado da cadeia.
+  
+  
+  
+  
+  
+  
   verifyStateIntegrity() {
     if (this._stateTransitionPending || this._stateRecoveryRequired || this.db.inTransaction || this.db.prepare('SELECT 1 FROM pending_contract_blocks LIMIT 1').get()) {
       return { ok: false, repaired: false, motivo: 'state transition pending' };
@@ -1504,7 +1504,7 @@ class Chain {
   }
 
   async _insertBlockDirect(blk) {
-    // Keep legacy callers on the validated, serialized and journaled path.
+    
     return this.addBlock(blk);
   }
 
@@ -1632,7 +1632,7 @@ class Diff_Manager {
     const prevInterval = this._ancestorAt(parentHash, Math.max(0, height - interval));
     if (prevInterval && latest) {
       const actual = latest.timestamp - prevInterval.timestamp;
-      // actual is the timespan of (interval) blocks, not a single block
+      
       const expectedSpan = expected * interval;
       const target = BigInt(latest.target || this.cfg.initialTarget);
       if (actual < expectedSpan / 2) return target * 2n;
@@ -1679,10 +1679,10 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(blockTime));
   }
 
-  // Capacity-derived reference base target for a block at `height`: the value
-  // that makes the expected best deadline of every mature registration match
-  // `expectedTimePerBlock`. Pure function of the chain up to `height - 1`
-  // (explicit parent lookup, not this.height), so all nodes agree.
+  
+  
+  
+  
   _baseTargetIdealFor(height, parentHash) {
     const expectedTime = Math.max(1, this.cfg.expectedTimePerBlock || 60);
     let candidates = 0n;
@@ -1697,8 +1697,8 @@ class Diff_Manager {
     return (BigInt(2) ** BigInt(64)) / (candidates * BigInt(expectedTime));
   }
 
-  // Clamp a candidate base target: keep it within a generous, scale-free factor
-  // of the capacity-derived reference, then inside [baseTargetMin, baseTargetMax].
+  
+  
   _clampBaseTarget(value, ideal) {
     let t = value;
     if (ideal && ideal > 0n) {
@@ -1726,18 +1726,18 @@ class Diff_Manager {
     const prevTarget = BigInt((parentRow && parentRow.base_target) || this._defaultBaseTarget());
     const ideal = this._baseTargetIdealFor(height, parentHash);
 
-    // Re-evaluate at most once per window; between windows the base target is
-    // frozen. The old code applied a +/-30% step to *every* block, which
-    // compounded into an exponential runaway and drove the base target down to
-    // an un-mineable floor whenever the miner was faster than the target.
+    
+    
+    
+    
     const window = Math.max(8, safeInt(this.cfg.baseTargetWindow, 128));
 
-    // Bootstrap: until one full measurement window exists, follow the
-    // capacity-derived reference directly instead of the fixed genesis value.
-    // `genesisBaseTarget` assumes a large network; on a small one it is several
-    // times too low and each block then takes minutes, so the first window
-    // would be hours away. Tracking the reference self-sizes the network
-    // immediately, and the feedback step below refines it afterwards.
+    
+    
+    
+    
+    
+    
     if (height < window) {
       const seed = ideal && ideal > 0n ? ideal : prevTarget;
       return String(this._clampBaseTarget(seed, ideal));
@@ -1750,10 +1750,10 @@ class Diff_Manager {
     const actualDuration = prev.timestamp - oldest.timestamp;
     if (actualDuration <= 0) return String(prevTarget);
 
-    // Proportional step: deadline scales as 1/baseTarget, so measured/expected
-    // drives the base target straight to the target block time. Bounded per
-    // window to avoid overshoot from a noisy measurement, then clamped against
-    // the capacity reference so a noisy measurement cannot run it away.
+    
+    
+    
+    
     const meanSeconds = actualDuration / window;
     const maxMove = Math.min(0.9, Math.max(0.01, Number(this.cfg.baseTargetMaxMove ?? 0.5)));
     const ratio = meanSeconds / expectedTime;
@@ -1855,11 +1855,11 @@ class MemPool_Manager {
     const user = this.db.prepare('SELECT balance, nonce FROM users WHERE lower(address) = lower(?)').get(sender);
     const curNonce = user ? safeInt(user.nonce, 0) : 0;
     const curBalance = user ? safeBigInt(user.balance, 0n) : 0n;
-    // Accept the confirmed nonce or any near-future nonce: a client preparing
-    // several txs back to back (e.g. auto-registering multiple plots) hands out
-    // consecutive nonces, and nonce-gapped txs simply stay queued until their
-    // predecessors are mined. This matches the forger's sequential selection
-    // (which only drops nonces below the projected value).
+    
+    
+    
+    
+    
     const txNonce = safeInt(tx.nonce, 0);
     if (txNonce < curNonce) return { ok: false, motivo: `stale nonce (tx=${txNonce}, account=${curNonce})` };
     const maxFutureNonce = curNonce + Math.max(1, safeInt(this.cfg.maxFutureNonce, 64));
@@ -1901,7 +1901,7 @@ class MemPool_Manager {
           if (String(other.from_addr || '').toLowerCase() === senderLc) pendingForSender++;
           const registration = PocPlotV4.decodeRegistration(other.data);
           if (registration.plot_id === events[0].plot_id) return { ok: false, motivo: 'plot_id already has a pending registration' };
-        } catch { /* malformed unrelated mempool entry */ }
+        } catch {   }
       }
       if (pendingTotal >= maxPerBlock) return { ok: false, motivo: `too many pending plot registrations (max ${maxPerBlock})` };
       if (pendingForSender >= maxPerMiner) return { ok: false, motivo: `miner already has a pending plot registration (max ${maxPerMiner})` };

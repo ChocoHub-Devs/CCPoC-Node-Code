@@ -31,8 +31,8 @@ function capTxGasLimit(tx) {
 }
 
 function minimumFee(tx, baseFee) {
-  // `fee` is the signed maximum total charge. Reserve enough for the full
-  // declared gas limit at the current gas price; settlement refunds unused gas.
+  
+  
   const gasLimit = safeInt(tx && tx.gas_limit, estimateIntrinsicGas(tx || {}));
   const price = maximumGasPrice(tx, baseFee);
   return BigInt(Math.max(0, gasLimit)) * price;
@@ -58,7 +58,7 @@ function totalGasUsed(tx, executionGasUsed = 0, gasRefund = 0) {
   const limit = Math.max(intrinsic, safeInt(tx && tx.gas_limit, intrinsic));
   const executionLimit = Math.max(0, limit - intrinsic);
   const execution = Math.min(executionLimit, Math.max(0, safeInt(executionGasUsed, 0)));
-  // Shanghai refund cap: at most one fifth of gas consumed before refunds.
+  
   const refund = Math.min(Math.max(0, safeInt(gasRefund, 0)), Math.floor((intrinsic + execution) / 5));
   return intrinsic + execution - refund;
 }

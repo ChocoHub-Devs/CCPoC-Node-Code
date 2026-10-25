@@ -146,9 +146,9 @@ class P2PWebSocketServer {
       this._pingTimer = setInterval(() => {
         for (const ws of this.wss.clients) {
           if (!ws.isAlive) {
-            // Dead client: drop it and continue pinging the rest. Using `return`
-            // here previously aborted the whole loop, leaving remaining clients
-            // unpinned and undetected.
+            
+            
+            
             this.clients.delete(ws);
             ws.terminate();
             continue;
@@ -181,12 +181,18 @@ class P2PWebSocketServer {
 
   broadcast(type, data, excludeWs = null) {
     const msg = JSON.stringify({ type, data, timestamp: Date.now() });
+    let queued = 0;
     for (const ws of this.wss.clients) {
       if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
         if (!ws.subscriptions || Array.from(ws.subscriptions).some(sub => this._topicMatches(sub, type))) {
           ws.send(msg);
+          queued++;
         }
       }
+    }
+    if (type === 'new_block' || type === 'new_tx') {
+      const item = data && (data.block || data.tx);
+      log('debug', `[P2P-WS] queued ${type} clients=${queued} bytes=${Buffer.byteLength(msg)}${type === 'new_block' ? ` height=${item && item.height} hash=${String(item && item.hash || '').slice(0, 12)}` : ` hash=${String(item && item.hash || '').slice(0, 12)}`}`);
     }
   }
 
@@ -311,9 +317,11 @@ class P2PWebSocketClient {
     if (this.chain.db.prepare('SELECT 1 FROM blocks WHERE hash = ?').get(block.hash)) return;
     
     log('debug', `[P2P-WS] Received new block #${block.height} via WebSocket`);
+    log('debug', `[P2P-WS] block payload height=${block.height} hash=${String(block.hash || '').slice(0, 12)} txs=${(block.transactions || []).length} bytes=${Buffer.byteLength(JSON.stringify(block))}`);
     
     block._from_local_forge = false;
     let result = await this.chain.addBlock(block);
+    log('debug', `[P2P-WS] block result=${result.ok ? 'accepted' : 'rejected'} height=${block.height} hash=${String(block.hash || '').slice(0, 12)} reason=${result.motivo || 'ok'}`);
     
     if (result.ok) {
       this._send({ type: 'subscribe', topics: ['blocks', 'transactions'] });
@@ -327,12 +335,16 @@ class P2PWebSocketClient {
       if (this.chain.db.prepare('SELECT 1 FROM mempool WHERE hash = ?').get(tx.hash)) return;
       if (this.chain.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(tx.hash)) return;
 
+      log('debug', `[P2P-WS] received transaction hash=${String(tx.hash || '').slice(0, 12)} bytes=${Buffer.byteLength(JSON.stringify(tx))}`);
       const validation = await this.chain.validateTxForMempool(tx);
       if (validation.ok) {
         const result = this.chain.addMempoolTx(tx);
+        log('debug', `[P2P-WS] transaction result=${result.ok ? 'accepted' : 'rejected'} hash=${String(tx.hash || '').slice(0, 12)} reason=${result.motivo || 'ok'}`);
         if (result.ok && result.motivo !== 'Tx already in mempool') {
           this.sync.broadcastTx(tx);
         }
+      } else {
+        log('debug', `[P2P-WS] transaction rejected hash=${String(tx.hash || '').slice(0, 12)} reason=${validation.motivo || 'invalid'}`);
       }
     } finally {
       release();

@@ -114,7 +114,7 @@ function recoverPublicKeyForAddress(message, sigB64, expectedAddress) {
     try {
       const pub = Buffer.from(raw.addRecoveryBit(i).recoverPublicKey(digest).toRawBytes(false));
       if (pubkeyToAddress(pub).toLowerCase() === expected) return pub;
-    } catch { /* try next recovery bit */ }
+    } catch {   }
   }
   return null;
 }

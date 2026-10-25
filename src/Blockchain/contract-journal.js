@@ -13,9 +13,9 @@ function ensureContractJournalSchema(db) {
   `);
 }
 
-// Write-ahead undo records commit before any pre-execution SQL mutation. The
-// block transaction deletes them atomically with the block and its history.
-// A process interruption leaves records which startup restores before loading tip.
+
+
+
 class ContractJournal {
   constructor(db, restore) { this.db = db; this.restore = restore; }
 

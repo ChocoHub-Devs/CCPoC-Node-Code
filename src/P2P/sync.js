@@ -4,18 +4,28 @@ const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
 const { CONSENSUS_VERSION } = require('../consensus/protocol');
 
-const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024; // 16 MiB
+const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024; 
 
 function fetchJSON(url, opts = {}) {
   const u = new URL(url);
   const mod = u.protocol === 'https:' ? require('https') : require('http');
   const maxBytes = opts.maxBytes || DEFAULT_MAX_RESPONSE_BYTES;
+  const method = opts.method || 'GET';
+  const endpoint = `${u.host}${u.pathname}`;
+  let requestBody = '';
+  try { requestBody = opts.body ? JSON.stringify(opts.body) : ''; }
+  catch (e) { return Promise.reject(e); }
+  const requestBytes = Buffer.byteLength(requestBody);
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     let settled = false;
     const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const logTransfer = (result, status = '-', responseBytes = 0) => {
+      log('debug', `[P2P] HTTP ${method} ${endpoint} status=${status} request_bytes=${requestBytes} response_bytes=${responseBytes} duration_ms=${Date.now() - startedAt} result=${result}`);
+    };
     const timeout = (opts.timeout || 10) * 1000;
     const req = mod.request(url, {
-      method: opts.method || 'GET',
+      method,
       headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
       timeout,
     }, (res) => {
@@ -23,9 +33,10 @@ function fetchJSON(url, opts = {}) {
       let size = 0;
       res.on('data', (c) => {
         size += c.length;
-        // Guard against peers returning an unbounded response body (DoS).
+        
         if (size > maxBytes) {
           log('warn', `[P2P] Response from ${u.host} exceeded ${maxBytes} bytes; aborting`);
+          logTransfer('response_too_large', res.statusCode, size);
           res.destroy();
           req.destroy();
           done(null);
@@ -34,15 +45,46 @@ function fetchJSON(url, opts = {}) {
         data += c;
       });
       res.on('end', () => {
-        try { done(JSON.parse(data)); } catch { done(null); }
+        try {
+          const parsed = JSON.parse(data);
+          logTransfer(res.statusCode >= 200 && res.statusCode < 300 ? 'ok' : 'http_error', res.statusCode, size);
+          done(parsed);
+        } catch {
+          logTransfer('invalid_json', res.statusCode, size);
+          done(null);
+        }
       });
-      res.on('error', () => done(null));
+      res.on('error', () => {
+        if (!settled) {
+          logTransfer('response_error', res.statusCode, size);
+          done(null);
+        }
+      });
     });
-    req.on('error', () => done(null));
-    req.on('timeout', () => { req.destroy(); done(null); });
-    if (opts.body) req.write(JSON.stringify(opts.body));
+    req.on('error', (err) => {
+      if (!settled) {
+        logTransfer(err.code || 'request_error');
+        done(null);
+      }
+    });
+    req.on('timeout', () => {
+      if (!settled) {
+        logTransfer('timeout');
+        req.destroy();
+        done(null);
+      }
+    });
+    if (requestBody) req.write(requestBody);
+    log('debug', `[P2P] HTTP -> ${method} ${endpoint} request_bytes=${requestBytes}`);
     req.end();
   });
+}
+
+function peerLabel(peerUrl) {
+  try {
+    const u = new URL(peerUrl);
+    return `${u.protocol}//${u.host}`;
+  } catch { return 'invalid-peer-url'; }
 }
 
 class SyncEngine {
@@ -188,6 +230,7 @@ class SyncEngine {
       try {
         const data = await fetchJSON(`${peerUrl}/api/blocks?from=${from}&limit=50`, { timeout: 15 });
         if (!data || !Array.isArray(data.blocks) || !data.blocks.length) break;
+        log('debug', `[P2P] received sync batch peer=${peerLabel(peerUrl)} from=${from} count=${data.blocks.length} first_height=${data.blocks[0].height} last_height=${data.blocks[data.blocks.length - 1].height}`);
         let advanced = false;
         for (const block of data.blocks) {
           if (block.height < from) continue;
@@ -383,23 +426,59 @@ class SyncEngine {
 
   async broadcastBlock(block) {
     const key = `block:${block && block.hash ? block.hash : hashBlock(block)}`;
-    if (!this._rememberBroadcast(key)) return { accepted: 0, total: 0, noPeers: false, deduped: true };
+    if (!this._rememberBroadcast(key)) {
+      log('debug', `[P2P] block broadcast deduplicated height=${block && block.height} hash=${String(block && block.hash || '').slice(0, 12)}`);
+      return { accepted: 0, total: 0, noPeers: false, deduped: true };
+    }
     const peers = this.peers.active(10);
-    if (!peers.length) return { accepted: 0, total: 0, noPeers: true };
+    if (!peers.length) {
+      log('debug', `[P2P] block broadcast skipped: no active peers height=${block && block.height} hash=${String(block && block.hash || '').slice(0, 12)}`);
+      return { accepted: 0, total: 0, noPeers: true };
+    }
+    const startedAt = Date.now();
+    log('debug', `[P2P] broadcasting block height=${block.height} hash=${String(block.hash || '').slice(0, 12)} txs=${(block.transactions || []).length} peers=${peers.length}`);
     const results = await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/broadcast/block`, {
       method: 'POST', body: { block }, timeout: 10,
     })));
     const accepted = results.filter(r => r.status === 'fulfilled' && r.value && r.value.ok).length;
+    results.forEach((result, index) => {
+      const peer = peerLabel(peers[index].url);
+      if (result.status === 'fulfilled' && result.value && result.value.ok) {
+        log('debug', `[P2P] block accepted by peer=${peer} height=${block.height} hash=${String(block.hash || '').slice(0, 12)}`);
+      } else {
+        const reason = result.status === 'rejected' ? 'request_rejected'
+          : result.value && result.value.motivo ? result.value.motivo : 'transport_or_peer_rejected';
+        log('debug', `[P2P] block not accepted by peer=${peer} height=${block.height} hash=${String(block.hash || '').slice(0, 12)} reason=${reason}`);
+      }
+    });
+    log('debug', `[P2P] block broadcast complete height=${block.height} accepted=${accepted}/${peers.length} duration_ms=${Date.now() - startedAt}`);
     return { accepted, total: peers.length, noPeers: false };
   }
 
   async broadcastTx(tx) {
     const key = `tx:${tx && tx.hash ? tx.hash : hashTransaction(tx)}`;
-    if (!this._rememberBroadcast(key)) return { deduped: true };
+    if (!this._rememberBroadcast(key)) {
+      log('debug', `[P2P] transaction broadcast deduplicated hash=${String(tx && tx.hash || '').slice(0, 12)}`);
+      return { deduped: true };
+    }
     const peers = this.peers.active(10);
-    await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/broadcast/tx`, {
+    const startedAt = Date.now();
+    if (!peers.length) {
+      log('debug', `[P2P] transaction broadcast skipped: no active peers hash=${String(tx && tx.hash || '').slice(0, 12)}`);
+      return { accepted: 0, total: 0, noPeers: true };
+    }
+    log('debug', `[P2P] broadcasting transaction hash=${String(tx && tx.hash || '').slice(0, 12)} peers=${peers.length}`);
+    const results = await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/broadcast/tx`, {
       method: 'POST', body: { tx }, timeout: 5,
     })));
+    const accepted = results.filter(r => r.status === 'fulfilled' && r.value && r.value.ok).length;
+    results.forEach((result, index) => {
+      const peer = peerLabel(peers[index].url);
+      const acceptedByPeer = result.status === 'fulfilled' && result.value && result.value.ok;
+      log('debug', `[P2P] transaction ${acceptedByPeer ? 'accepted' : 'not accepted'} by peer=${peer} hash=${String(tx && tx.hash || '').slice(0, 12)}${acceptedByPeer ? '' : ` reason=${result.status === 'rejected' ? 'request_rejected' : (result.value && result.value.error) || 'transport_or_peer_rejected'}`}`);
+    });
+    log('debug', `[P2P] transaction broadcast complete hash=${String(tx && tx.hash || '').slice(0, 12)} accepted=${accepted}/${peers.length} duration_ms=${Date.now() - startedAt}`);
+    return { accepted, total: peers.length, noPeers: false };
   }
 
   async broadcastForkVoteFinalize(request) {

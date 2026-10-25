@@ -120,7 +120,7 @@ function applySnapshot(db, snapshot) {
       db.prepare('DELETE FROM contract_logs').run();
       const insLog = db.prepare('INSERT OR REPLACE INTO contract_logs (tx_hash, block_height, block_hash, log_index, address, topics, data) VALUES (?,?,?,?,?,?,?)');
       for (const l of snapshot.contract_logs || []) insLog.run(l.tx_hash, l.block_height, l.block_hash, l.log_index, l.address, l.topics, l.data);
-    } catch (e) { /* contract_logs may be absent */ }
+    } catch (e) {   }
     try {
       db.prepare('DELETE FROM plot_registration_events').run();
       const insPlot = db.prepare(`
