@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { keccak256 } = require('ethers');
 const { secp256k1 } = require('@noble/curves/secp256k1.js');
 const rlp = require('@ethereumjs/rlp');
+const { CONSENSUS_VERSION } = require('../consensus/protocol');
 const ZERO_HASH = '0'.repeat(64);
 
 const SECP_COMPRESSED_LEN = 33;
@@ -512,11 +513,14 @@ function hashBlock(bloco) {
     winnerProofStr = JSON.stringify(wp);
   }
   const d = {
+    base_fee: String(bloco.base_fee || '0'),
     base_target: String(bloco.base_target || '0'),
     challenge_id: bloco.challenge_id || '',
     contract_state_root: bloco.contract_state_root || '',
     forger: bloco.forger || (bloco.miner || ''),
     generation_signature: bloco.generation_signature || ZERO_HASH,
+    gas_limit: String(bloco.gas_limit || '0'),
+    gas_used: String(bloco.gas_used || '0'),
     height: bloco.height || 0,
     miner: bloco.miner || '',
     nonce: String(bloco.nonce || '0'),
@@ -525,6 +529,7 @@ function hashBlock(bloco) {
     rewards: rewardsStr,
     target: String(bloco.target || '0'),
     timestamp: bloco.timestamp || 0,
+    chain_id: String(bloco.chain_id ?? ''),
     tx_count: parseInt(bloco.tx_count || 0, 10),
     tx_root: bloco.tx_root || '',
     state_root: bloco.state_root || '',
@@ -539,8 +544,12 @@ function hashBlock(bloco) {
         plot_id: String(plot.plot_id).toLowerCase(),
       })).sort((a, b) => a.plot_id.localeCompare(b.plot_id))
       : [];
-    d.consensus_version = 4;
+    d.consensus_version = Number(bloco.consensus_version || CONSENSUS_VERSION);
     d.chain_id = String(bloco.chain_id ?? '');
+    const consensusParams = bloco.consensus_params && typeof bloco.consensus_params === 'object'
+      ? Object.fromEntries(Object.entries(bloco.consensus_params).sort(([a], [b]) => a.localeCompare(b)))
+      : {};
+    d.consensus_params = JSON.stringify(consensusParams);
     d.genesis_plot_registrations = JSON.stringify(genesisPlots);
   }
   return sha256hex(JSON.stringify(d, Object.keys(d).sort()));
@@ -554,6 +563,8 @@ function computeContractStateLeaves(db) {
   for (const s of storage) leaves.push(sha256hex(`storage:${String(s.contract_address).toLowerCase()}:${s.slot}:${s.value}`));
   const accounts = db.prepare('SELECT address, balance FROM smart_contract_accounts ORDER BY lower(address)').all();
   for (const a of accounts) leaves.push(sha256hex(`account:${String(a.address).toLowerCase()}:${a.balance}`));
+  const nonces = db.prepare('SELECT address, nonce FROM smart_contract_nonces ORDER BY lower(address)').all();
+  for (const n of nonces) leaves.push(sha256hex(`nonce:${String(n.address).toLowerCase()}:${n.nonce}`));
   const contracts = db.prepare('SELECT address, creator, code FROM smart_contracts ORDER BY lower(address)').all();
   for (const c of contracts) {
     const codeHash = crypto.createHash('sha256').update(String(c.code || '')).digest('hex');

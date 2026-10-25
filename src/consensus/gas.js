@@ -31,22 +31,46 @@ function capTxGasLimit(tx) {
 }
 
 function minimumFee(tx, baseFee) {
+  // `fee` is the signed maximum total charge. Reserve enough for the full
+  // declared gas limit at the current gas price; settlement refunds unused gas.
+  const gasLimit = safeInt(tx && tx.gas_limit, estimateIntrinsicGas(tx || {}));
+  const price = maximumGasPrice(tx, baseFee);
+  return BigInt(Math.max(0, gasLimit)) * price;
+}
+
+function maximumGasPrice(tx, fallback = 1) {
+  return BigInt((tx && tx.maxFeePerGas) || (tx && tx.gas_price) || fallback || 1);
+}
+
+function effectiveGasPrice(tx, baseFee = 0) {
+  const base = BigInt(baseFee || 0);
+  if (tx && tx.maxFeePerGas != null) {
+    const cap = BigInt(tx.maxFeePerGas);
+    const tip = BigInt(tx.maxPriorityFeePerGas || 0);
+    const candidate = base + tip;
+    return candidate < cap ? candidate : cap;
+  }
+  return BigInt((tx && tx.gas_price) || base || 0);
+}
+
+function totalGasUsed(tx, executionGasUsed = 0, gasRefund = 0) {
   const intrinsic = estimateIntrinsicGas(tx);
-  return BigInt(intrinsic) * BigInt(baseFee || 1);
+  const limit = Math.max(intrinsic, safeInt(tx && tx.gas_limit, intrinsic));
+  const executionLimit = Math.max(0, limit - intrinsic);
+  const execution = Math.min(executionLimit, Math.max(0, safeInt(executionGasUsed, 0)));
+  // Shanghai refund cap: at most one fifth of gas consumed before refunds.
+  const refund = Math.min(Math.max(0, safeInt(gasRefund, 0)), Math.floor((intrinsic + execution) / 5));
+  return intrinsic + execution - refund;
 }
 
 function safeInt(v, def) { const n = Number(v); return Number.isFinite(n) ? Math.trunc(n) : def; }
 
-function nextBaseFee(parentBaseFee, parentGasUsed, targetGas, minGasPrice, mempoolPendingCount = 0) {
+function nextBaseFee(parentBaseFee, parentGasUsed, targetGas, minGasPrice) {
   if (parentGasUsed === targetGas) return parentBaseFee;
   const delta = parentGasUsed > targetGas
     ? (parentBaseFee * BigInt(parentGasUsed - targetGas)) / BigInt(targetGas) / 8n
     : -(parentBaseFee * BigInt(targetGas - parentGasUsed)) / BigInt(targetGas) / 8n;
   let next = parentBaseFee + delta;
-
-  if (mempoolPendingCount < targetGas / GAS_PARAMS.simpleTransferGas / 4) {
-    next = (next * 95n) / 100n;
-  }
 
   if (next < BigInt(minGasPrice)) next = BigInt(minGasPrice);
   return next;
@@ -58,4 +82,7 @@ module.exports = {
   nextBaseFee,
   capTxGasLimit,
   minimumFee,
+  totalGasUsed,
+  maximumGasPrice,
+  effectiveGasPrice,
 };

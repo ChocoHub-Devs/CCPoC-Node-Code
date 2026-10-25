@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRootAfterTxs, calculateMiningReward, computeDeadline, verifySignature, pubkeyToAddress, canonicalTxMessage, proofMessage, recoverTransactionSender } = require('../crypto-utils/crypto');
 const { log } = require('../../config/config');
 const PocPlotV4 = require('../consensus/poc-plot-v4');
+const { estimateIntrinsicGas, GAS_PARAMS } = require('../consensus/gas');
 
 
 class ChallengeManager {
@@ -22,7 +23,7 @@ class ChallengeManager {
     const targetIdx = PocPlotV4.challengeTargetSlot(challengeId);
     const challengeGrace = Math.max(15, Math.floor((this.cfg.expectedTimePerBlock || 60) / 2));
     const challengeExpiredGraceSec = Math.max(this.cfg.challengeExpiredGraceSec || 300, (this.cfg.expectedTimePerBlock || 60) * 2);
-    const baseTarget = this.chain._baseTargetForHeight(this.chain.height);
+    const baseTarget = this.chain._baseTargetForHeight(this.chain.height + 1, tip && tip.hash);
     const withBt = (r) => (r ? {
       ...r,
       target_scoop_index: targetIdx,
@@ -206,17 +207,19 @@ class ChallengeManager {
       const txRoot = merkleRoot(txHashes);
       const totalReward = calculateMiningReward(newHeight, this.cfg);
       const rewardCc = String(totalReward);
-      const targetValue = chain._targetForHeight(newHeight);
+      const targetValue = chain._targetForHeight(newHeight, parent && parent.hash);
       const genSig = parent ? sha256hex((parent.generation_signature || ZERO_HASH) + parent.hash) : ZERO_HASH;
       const block = {
-        height: newHeight, parent_hash: parent ? parent.hash : ZERO_HASH, generation_signature: genSig,
+        height: newHeight, chain_id: this.cfg.chainId, parent_hash: parent ? parent.hash : ZERO_HASH, generation_signature: genSig,
         timestamp: now, miner, tx_count: mempoolTxs.length, tx_root: txRoot,
         challenge_id: challenge.challenge_id, nonce: String(Math.floor(deadline)),
         difficulty: '0', target: String(targetValue), reward_units: '0', reward_cc: String(rewardCc),
-        proof_digest: proofDigest, plot_id: plotId, base_target: chain._baseTargetForHeight(newHeight),
+        proof_digest: proofDigest, plot_id: plotId, base_target: chain._baseTargetForHeight(newHeight, parent && parent.hash),
         state_root: computeStateRootAfterTxs(this.db, mempoolTxs, rewardDistribution),
-        transactions: mempoolTxs, signature: '', gas_used: mempoolTxs.length * 21000, gas_limit: 30000000,
-        base_fee: String(chain._baseFeeForHeight(newHeight)),
+        transactions: mempoolTxs, signature: '',
+        gas_used: mempoolTxs.reduce((sum, tx) => sum + estimateIntrinsicGas(tx), 0),
+        gas_limit: GAS_PARAMS.blockGasLimit,
+        base_fee: String(chain._baseFeeForHeight(newHeight, parent && parent.hash)),
         miner_public_key: this.cfg.minerPublicKey || '',
         forger: String(this.cfg.minerAddress || '').toLowerCase(),
         _from_local_forge: true, rewards: rewardDistribution,
@@ -233,6 +236,7 @@ class ChallengeManager {
   }
 
   async finalizeExpiredChallenges(chain, syncEngine) {
+    if (chain && chain._stateTransitionPending) return;
     if (!this.db || this.db.open === false) return;
     const now = Math.floor(Date.now() / 1000);
     const nextHeight = chain.height + 1;

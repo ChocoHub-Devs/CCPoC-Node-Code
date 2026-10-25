@@ -166,6 +166,7 @@ class IncrementalStateRoot {
     this.contractStorageTrie = new SparseMerkleTrie();
     this.contractAccountTrie = new SparseMerkleTrie();
     this.contractCodeTrie = new SparseMerkleTrie();
+    this.contractNonceTrie = new SparseMerkleTrie();
   }
 
   _normalizeAddr(address) {
@@ -243,8 +244,9 @@ class IncrementalStateRoot {
     const storageRoot = this.contractStorageTrie.getRoot();
     const accountRoot = this.contractAccountTrie.getRoot();
     const codeRoot = this.contractCodeTrie.getRoot();
+    const nonceRoot = this.contractNonceTrie.getRoot();
     
-    const leaves = [userRoot, storageRoot, accountRoot, codeRoot].filter(r => r !== EMPTY_ROOT);
+    const leaves = [userRoot, storageRoot, accountRoot, nonceRoot, codeRoot].filter(r => r !== EMPTY_ROOT);
     if (leaves.length === 0) return ZERO_HASH;
     
     let nodes = [...leaves];
@@ -266,6 +268,7 @@ class IncrementalStateRoot {
       storageRoot: this.contractStorageTrie.getRoot(),
       accountRoot: this.contractAccountTrie.getRoot(),
       codeRoot: this.contractCodeTrie.getRoot(),
+      nonceRoot: this.contractNonceTrie.getRoot(),
     };
   }
 
@@ -275,6 +278,7 @@ class IncrementalStateRoot {
       contractStorageTrie: this.contractStorageTrie.clone(),
       contractAccountTrie: this.contractAccountTrie.clone(),
       contractCodeTrie: this.contractCodeTrie.clone(),
+      contractNonceTrie: this.contractNonceTrie.clone(),
     };
   }
 
@@ -283,9 +287,22 @@ class IncrementalStateRoot {
     this.contractStorageTrie = snapshot.contractStorageTrie;
     this.contractAccountTrie = snapshot.contractAccountTrie;
     this.contractCodeTrie = snapshot.contractCodeTrie;
+    this.contractNonceTrie = snapshot.contractNonceTrie;
   }
 
   async loadFromDB(db) {
+    return this.reloadFromDB(db);
+  }
+
+  reloadFromDB(db) {
+    // Rebuild from the materialized database, rather than merging into the
+    // previous trie. A reorg can remove accounts, storage slots, or contracts.
+    this.userTrie = new SparseMerkleTrie();
+    this.contractStorageTrie = new SparseMerkleTrie();
+    this.contractAccountTrie = new SparseMerkleTrie();
+    this.contractCodeTrie = new SparseMerkleTrie();
+    this.contractNonceTrie = new SparseMerkleTrie();
+
     const users = db.prepare('SELECT address, balance, nonce FROM users ORDER BY address').all();
     for (const u of users) {
       this.updateUser(u.address, u.balance, u.nonce);
@@ -301,6 +318,11 @@ class IncrementalStateRoot {
       this.updateContractAccount(a.address, a.balance);
     }
 
+    const nonces = db.prepare('SELECT address, nonce FROM smart_contract_nonces ORDER BY lower(address)').all();
+    for (const n of nonces) {
+      const addr = this._normalizeAddr(n.address);
+      this.contractNonceTrie.set(addr, sha256hex(`nonce:${addr}:${n.nonce}`));
+    }
     const contracts = db.prepare('SELECT address, code FROM smart_contracts ORDER BY lower(address)').all();
     for (const c of contracts) {
       const codeHash = crypto.createHash('sha256').update(String(c.code || '')).digest('hex');

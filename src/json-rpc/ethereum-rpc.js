@@ -3,11 +3,13 @@ const WebSocket = require('ws');
 const { keccak256 } = require('ethers');
 const { createCustomCommon, Hardfork, Mainnet } = require('@ethereumjs/common');
 const { createTxFromRLP } = require('@ethereumjs/tx');
+const { encode: encodeRlp } = require('@ethereumjs/rlp');
 const { hexToBytes, bytesToHex } = require('@ethereumjs/util');
 const { evmTxDigest, evmTxHash, signatureFromHex, recoverTransactionSender, isValidAddress, toChecksumAddress, sha256hex } = require('../crypto-utils/crypto');
 const { logsToBloom, receiptsRoot } = require('./evm-bloom');
 const { log } = require('../../config/config');
 const { GAS_PARAMS, estimateIntrinsicGas, minimumFee } = require('../consensus/gas');
+const { DEFAULT_CHAIN_ID } = require('../consensus/protocol');
 
 const ZERO_ADDRESS = '0x' + '0'.repeat(40);
 const ZERO_HASH = '0'.repeat(64);
@@ -115,7 +117,7 @@ class EthereumRPC {
 
   _resolveChainId(cfgChainId) {
     let n = Number(cfgChainId);
-    if (!Number.isInteger(n) || n <= 0) n = 19971971;
+    if (!Number.isInteger(n) || n <= 0) n = DEFAULT_CHAIN_ID;
     return n;
   }
 
@@ -203,8 +205,7 @@ class EthereumRPC {
     const data = normalizeHex(txObj.data || '0x');
     const value = parseQuantity(txObj.value == null ? 0 : txObj.value, 'value');
     const hasData = data.length > 2 && data !== '0x';
-    const dataBytes = hasData ? (data.length - 2) / 2 : 0;
-    const intrinsic = 21000n + (hasData ? (BigInt(dataBytes) * 16n + 68n) : 0n);
+    const intrinsic = BigInt(estimateIntrinsicGas({ data }));
     if (!this.smartContracts) return toQuantity(intrinsic);
     if (!to && !hasData) return toQuantity(intrinsic);
     try {
@@ -262,11 +263,13 @@ class EthereumRPC {
       v: '0x' + v.replace(/^0x/, ''),
       r: '0x' + r,
       s: '0x' + s,
-      type: tx.type != null ? toQuantityNumber(tx.type) : '0x0',
+      type: tx.tx_type != null ? toQuantityNumber(tx.tx_type) : (tx.type != null ? toQuantityNumber(tx.type) : '0x0'),
     };
-    if (tx.maxFeePerGas != null && tx.maxPriorityFeePerGas != null) {
-      rpc.maxFeePerGas = toQuantity(BigInt(tx.maxFeePerGas));
-      rpc.maxPriorityFeePerGas = toQuantity(BigInt(tx.maxPriorityFeePerGas));
+    const maxFeePerGas = tx.maxFeePerGas ?? tx.max_fee_per_gas;
+    const maxPriorityFeePerGas = tx.maxPriorityFeePerGas ?? tx.max_priority_fee_per_gas;
+    if (maxFeePerGas != null && maxFeePerGas !== '' && maxPriorityFeePerGas != null && maxPriorityFeePerGas !== '') {
+      rpc.maxFeePerGas = toQuantity(BigInt(maxFeePerGas));
+      rpc.maxPriorityFeePerGas = toQuantity(BigInt(maxPriorityFeePerGas));
     }
     return rpc;
   }
@@ -274,7 +277,7 @@ class EthereumRPC {
   _blockToRPC(blockDbRow, full) {
     if (!blockDbRow) return null;
     const txs = blockDbRow.hash
-      ? this.db.prepare('SELECT * FROM transactions WHERE block_hash = ? ORDER BY block_height ASC').all(blockDbRow.hash)
+      ? this.db.prepare('SELECT * FROM transactions WHERE block_hash = ? ORDER BY rowid ASC').all(blockDbRow.hash)
       : [];
     const baseFee = blockDbRow.base_fee || '0';
     const blockLogs = this._logsForBlock(blockDbRow.hash).map(lg => this._logToRPC(lg));
@@ -307,9 +310,33 @@ class EthereumRPC {
   _blockReceiptsRoot(txs) {
     const receipts = txs.map(t => {
       const logged = this._logsForTx(t.hash || evmTxHash(t)).map(lg => this._logToRPC(lg));
-      return JSON.stringify({ txHash: t.hash, from: t.from_addr, to: t.to_addr, status: '0x1', gasUsed: t.gas_limit || 21000, logsBloom: logsToBloom(logged) });
+      const stored = this.db.prepare('SELECT receipt_status, gas_used, cumulative_gas_used FROM transactions WHERE hash = ?').get(t.hash || evmTxHash(t));
+      const toBytes = value => Buffer.from(String(value || '').replace(/^0x/i, ''), 'hex');
+      const gasUsed = BigInt(stored ? stored.gas_used : estimateIntrinsicGas(t));
+      const cumulativeGasUsed = BigInt(stored ? stored.cumulative_gas_used : 0);
+      const status = !stored || stored.receipt_status ? Buffer.from([1]) : Buffer.alloc(0);
+      const logs = logged.map(lg => [
+        toBytes(lg.address),
+        (lg.topics || []).map(toBytes),
+        toBytes(lg.data),
+      ]);
+      const encoded = Buffer.from(encodeRlp([
+        status,
+        this._bigIntBytes(cumulativeGasUsed),
+        toBytes(logsToBloom(logged)),
+        logs,
+      ]));
+      const txType = Number(t.tx_type ?? t.type ?? 0);
+      return txType > 0 ? Buffer.concat([Buffer.from([txType]), encoded]) : encoded;
     });
     return receiptsRoot(receipts);
+  }
+
+  _bigIntBytes(value) {
+    if (value === 0n) return Buffer.alloc(0);
+    let hex = value.toString(16);
+    if (hex.length % 2) hex = '0' + hex;
+    return Buffer.from(hex, 'hex');
   }
 
   _logsForTx(txHash) {
@@ -371,13 +398,13 @@ class EthereumRPC {
       blockNumber: tx.block_height != null ? toQuantityNumber(tx.block_height) : null,
       from: normalizeAddr(tx.from_addr),
       to,
-      contractAddress: this._contractAddressFor(tx),
-      cumulativeGasUsed: '0x0',
-      gasUsed: toQuantity(tx.gas_limit || 21000),
-      effectiveGasPrice: toQuantity(tx.gas_price || '1'),
+      contractAddress: tx.receipt_status === 0 ? null : this._contractAddressFor(tx),
+      cumulativeGasUsed: toQuantity(tx.cumulative_gas_used || 0),
+      gasUsed: toQuantity(tx.gas_used || estimateIntrinsicGas(tx)),
+      effectiveGasPrice: toQuantity(tx.gas_used ? BigInt(tx.fee || 0) / BigInt(tx.gas_used) : 0n),
       logs,
       logsBloom: logsToBloom(logs),
-      status: '0x1',
+      status: tx.receipt_status ? '0x1' : '0x0',
       type: '0x0',
     };
   }
@@ -606,7 +633,7 @@ class EthereumRPC {
         const intrinsic = estimateIntrinsicGas({ data: dataHex });
         const gasLimit = Math.min(GAS_PARAMS.maxGasPerTx, Math.max(rawGas, intrinsic));
 
-        const min = minimumFee({ data: dataHex }, baseFee);
+        const min = minimumFee({ data: dataHex, gas_limit: gasLimit, gas_price: String(baseFee) }, baseFee);
         const cap = this.cfg.maxMempoolSize && this.cfg.maxMempoolSize > 0 ? this.cfg.maxMempoolSize : 5000;
         let pending = 0;
         try { pending = this.db.prepare('SELECT COUNT(*) AS c FROM mempool').get().c; } catch {}
@@ -728,12 +755,45 @@ class EthereumRPC {
         count = Math.min(count, 1024);
         const newest = resolveBlockTag(this.chain, p1);
         if (typeof newest !== 'number') throw rpcError(-32602, 'invalid block tag');
-        const base = this.chain._baseFeeForHeight(this.chain.height + 1);
+        const percentiles = Array.isArray(p2) ? p2.map(Number) : [];
+        if (percentiles.some((p, i) => !Number.isFinite(p) || p < 0 || p > 100 || (i > 0 && p < percentiles[i - 1]))) {
+          throw rpcError(-32602, 'reward percentiles must be sorted values from 0 to 100');
+        }
+        const first = Math.max(0, newest - count + 1);
+        const rows = this.db.prepare('SELECT height, gas_used, gas_limit, base_fee FROM blocks WHERE height BETWEEN ? AND ? ORDER BY height ASC').all(first, newest);
+        const byHeight = new Map(rows.map(row => [Number(row.height), row]));
+        const baseFees = [];
+        const gasUsedRatio = [];
+        const reward = [];
+        for (let height = first; height <= newest; height++) {
+          const row = byHeight.get(height);
+          const base = row && row.base_fee != null ? BigInt(row.base_fee) : BigInt(this.chain._baseFeeForHeight(height));
+          baseFees.push(toQuantity(base));
+          gasUsedRatio.push(row && Number(row.gas_limit) > 0 ? Number(row.gas_used || 0) / Number(row.gas_limit) : 0);
+          const tips = row ? this.db.prepare('SELECT fee, gas_used FROM transactions WHERE block_height = ?').all(height)
+            .map(tx => {
+              const price = tx.gas_used ? BigInt(tx.fee || 0) / BigInt(tx.gas_used) : 0n;
+              return { tip: price > base ? price - base : 0n, gas: Number(tx.gas_used || 0) };
+            }).sort((a, b) => a.tip < b.tip ? -1 : a.tip > b.tip ? 1 : 0) : [];
+          const totalGas = tips.reduce((sum, tip) => sum + tip.gas, 0);
+          reward.push(percentiles.map(percentile => {
+            const targetGas = Math.ceil(totalGas * percentile / 100);
+            let used = 0;
+            let selected = 0n;
+            for (const tip of tips) {
+              used += tip.gas;
+              selected = tip.tip;
+              if (used >= targetGas) break;
+            }
+            return toQuantity(selected);
+          }));
+        }
+        baseFees.push(toQuantity(BigInt(this.chain._baseFeeForHeight(newest + 1))));
         return {
-          oldestBlock: toQuantityNumber(Math.max(0, newest - count + 1)),
-          baseFeePerGas: Array.from({ length: count }, () => toQuantity(base)),
-          gasUsedRatio: Array.from({ length: count }, () => 0),
-          reward: Array.from({ length: count }, () => ['0x0']),
+          oldestBlock: toQuantityNumber(first),
+          baseFeePerGas: baseFees,
+          gasUsedRatio,
+          reward,
         };
       }
       case 'eth_createAccessList':
@@ -809,12 +869,19 @@ class EthereumRPC {
       this._handleWsSubscribe(ws, msg);
       return;
     }
-    this._dispatch(msg).then(resp => this._wsSend(ws, resp)).catch(() => {});
+    const release = this.chain && this.chain.tryAcquireStableRead ? this.chain.tryAcquireStableRead() : () => {};
+    if (!release) {
+      return this._wsSend(ws, { jsonrpc: '2.0', id: msg && msg.id != null ? msg.id : null, error: { code: -32005, message: 'canonical chain transition in progress; retry shortly' } });
+    }
+    this._dispatch(msg).then(resp => this._wsSend(ws, resp)).catch(() => {}).finally(release);
   }
 
   _handleWsSubscribe(ws, msg) {
     const id = msg.id == null ? null : msg.id;
     if (!msg || !msg.method) return;
+    if (this.chain && this.chain._stateTransitionPending) {
+      return this._wsSend(ws, { jsonrpc: '2.0', id, error: { code: -32005, message: 'canonical chain transition in progress; retry shortly' } });
+    }
     if (msg.method === 'eth_unsubscribe') {
       const subId = msg.params && msg.params[0];
       const sub = this._subs.get(subId);
@@ -850,7 +917,7 @@ class EthereumRPC {
   }
 
   _pollAndNotify() {
-    if (!this._subs.size || !this.chain) return;
+    if (!this._subs.size || !this.chain || this.chain._stateTransitionPending) return;
     const height = (this.chain && this.chain.height) || 0;
     for (const [subId, sub] of Array.from(this._subs)) {
       try {

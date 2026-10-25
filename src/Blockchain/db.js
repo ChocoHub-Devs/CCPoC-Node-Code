@@ -26,7 +26,7 @@ function initDB(dbPath, cfg) {
       proof_digest TEXT, plot_id TEXT, state_root TEXT, origin TEXT,
       total_fees_units TEXT, gas_used INTEGER, gas_limit INTEGER, base_fee TEXT DEFAULT '0',
       base_target TEXT, miner_public_key TEXT DEFAULT '',
-      body_pruned INTEGER DEFAULT 0
+      body_pruned INTEGER DEFAULT 0, chain_id TEXT DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
     CREATE INDEX IF NOT EXISTS idx_blocks_parent ON blocks(parent_hash);
@@ -36,7 +36,9 @@ function initDB(dbPath, cfg) {
       hash TEXT PRIMARY KEY, from_addr TEXT, to_addr TEXT, value TEXT,
       fee TEXT, nonce INTEGER, gas_limit INTEGER, gas_price TEXT,
       signature TEXT, block_height INTEGER, timestamp INTEGER,
-      block_hash TEXT DEFAULT '', chain_id TEXT DEFAULT ''
+      block_hash TEXT DEFAULT '', chain_id TEXT DEFAULT '', fee_cap TEXT DEFAULT '0',
+      receipt_status INTEGER DEFAULT 1, gas_used INTEGER DEFAULT 0, cumulative_gas_used INTEGER DEFAULT 0,
+      tx_type INTEGER DEFAULT 0, max_fee_per_gas TEXT DEFAULT '', max_priority_fee_per_gas TEXT DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_tx_from ON transactions(from_addr);
     CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_addr);
@@ -208,11 +210,13 @@ function initDB(dbPath, cfg) {
   try { db.prepare('ALTER TABLE mining_challenges ADD COLUMN base_target TEXT').run(); } catch {}
   try { db.prepare("ALTER TABLE blocks ADD COLUMN rewards_json TEXT DEFAULT '[]'").run(); } catch {}
   try { db.prepare("ALTER TABLE transactions ADD COLUMN chain_id TEXT DEFAULT ''").run(); } catch {}
-
-  const chainIdDefault = String(cfg.chainId || '0');
-  try {
-    db.prepare("UPDATE transactions SET chain_id = ? WHERE chain_id IS NULL OR chain_id = ''").run(chainIdDefault);
-  } catch (e) {}
+  try { db.prepare("ALTER TABLE transactions ADD COLUMN fee_cap TEXT DEFAULT '0'").run(); } catch {}
+  try { db.prepare('ALTER TABLE transactions ADD COLUMN receipt_status INTEGER DEFAULT 1').run(); } catch {}
+  try { db.prepare('ALTER TABLE transactions ADD COLUMN gas_used INTEGER DEFAULT 0').run(); } catch {}
+  try { db.prepare('ALTER TABLE transactions ADD COLUMN cumulative_gas_used INTEGER DEFAULT 0').run(); } catch {}
+  try { db.prepare('ALTER TABLE transactions ADD COLUMN tx_type INTEGER DEFAULT 0').run(); } catch {}
+  try { db.prepare("ALTER TABLE transactions ADD COLUMN max_fee_per_gas TEXT DEFAULT ''").run(); } catch {}
+  try { db.prepare("ALTER TABLE transactions ADD COLUMN max_priority_fee_per_gas TEXT DEFAULT ''").run(); } catch {}
 
   try {
     const rows = db.prepare('SELECT address, balance, nonce, public_key_secp256k1 FROM users WHERE address != lower(address)').all();
@@ -296,6 +300,7 @@ function initDB(dbPath, cfg) {
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_state_root ON snapshots(state_root)').run();
   } catch (e) { /* table likely exists */ }
 
+  require('./contract-journal').ensureContractJournalSchema(db);
   return db;
 }
 

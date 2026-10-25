@@ -3,6 +3,7 @@ const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningRe
 const { log, getLogBuffer } = require('../../config/config');
 const { estimateIntrinsicGas, minimumFee } = require('../consensus/gas');
 const PocPlotV4 = require('../consensus/poc-plot-v4');
+const { CONSENSUS_VERSION } = require('../consensus/protocol');
 
 const CC_SCALE = 10n ** 18n;
 function parseCcAmount(value) {
@@ -22,8 +23,9 @@ function formatCcAmount(units) {
 
 const rateLimitStore = new Map();
 function rateLimit(options = {}) {
-  const { windowMs = 600000, max = 100, keyPrefix = 'rl', message = 'Too many requests' } = options;
+  const { windowMs = 600000, max = 100, keyPrefix = 'rl', message = 'Too many requests', skip } = options;
   return (req, res, next) => {
+    if (skip && skip(req)) return next();
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
     const key = `${keyPrefix}:${ip}`;
     const now = Date.now();
@@ -134,7 +136,41 @@ class Server {
 
     app.use(express.static(PUBLIC_DIR, { maxAge: 0 }));
 
-    const apiLimiter = rateLimit({ windowMs: 60000, max: 120, keyPrefix: 'api', message: 'Too many API requests' });
+    // Reorg replay temporarily rewinds and rebuilds the canonical tables inside
+    // one SQLite transaction. Keep API and JSON-RPC readers from observing that
+    // in-flight state; block submission/forging must remain able to finish it.
+    app.use((req, res, next) => {
+      if ((req.method === 'POST' && (req.path === '/api/node/broadcast/block' || req.path === '/api/node/forge'))
+        || req.path === '/health' || req.path === '/health/liveness' || req.path === '/health/readiness') {
+        return next();
+      }
+      const release = this.chain.tryAcquireStableRead();
+      if (!release) {
+        res.setHeader('Retry-After', '1');
+        return res.status(503).json({ error: 'canonical chain transition in progress', retry_after: 1 });
+      }
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        release();
+      };
+      res.once('finish', finish);
+      res.once('close', finish);
+      next();
+    });
+
+    const isSyncTraffic = (req) => {
+      const path = req.path || '';
+      if (req.method === 'GET' && (
+        path === '/api/stats' || path === '/api/blocks' || path === '/peers'
+        || path === '/api/snapshot/latest' || path === '/api/zkp/latest'
+        || /^\/api\/block\/[^/]+$/.test(path)
+      )) return true;
+      return req.method === 'POST' && path === '/api/node/broadcast/block';
+    };
+    const apiLimiter = rateLimit({ windowMs: 60000, max: 120, keyPrefix: 'api', message: 'Too many API requests', skip: isSyncTraffic });
+    const syncLimiter = rateLimit({ windowMs: 60000, max: 300, keyPrefix: 'sync', message: 'Too many sync requests' });
     const mutationLimiter = rateLimit({ windowMs: 60000, max: 30, keyPrefix: 'mut', message: 'Too many mutation requests' });
     const walletLimiter = rateLimit({ windowMs: 60000, max: 10, keyPrefix: 'wlt', message: 'Too many wallet requests' });
     const p2pLimiter = rateLimit({ windowMs: 60000, max: 60, keyPrefix: 'p2p', message: 'Too many P2P requests' });
@@ -149,10 +185,11 @@ class Server {
 
     app.get('/', (req, res) => res.redirect('/api/stats'));
 
-    app.get('/api/stats', (req, res) => {
+    app.get('/api/stats', syncLimiter, (req, res) => {
       const stats = this.chain.getStats();
       res.json({
         ...stats, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
+        consensus_version: CONSENSUS_VERSION, genesis_hash: this.chain.getBlock(0)?.hash || null,
         symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.height + 1, this.cfg).toString(),
         current_reward_cc: Number(calculateMiningReward(this.chain.height + 1, this.cfg)) / 1e18,
         blocks_to_halving: this.cfg.halvingInterval - (this.chain.height % this.cfg.halvingInterval),
@@ -194,7 +231,7 @@ app.get('/api/state', (req, res) => {
   });
 });
 
-    app.get('/api/blocks', (req, res) => {
+    app.get('/api/blocks', syncLimiter, (req, res) => {
       const from = parseInt(req.query.from) || 0;
       const limit = Math.min(parseInt(req.query.limit) || 50, 200);
       let blocks;
@@ -211,7 +248,7 @@ app.get('/api/state', (req, res) => {
       res.json({ blocks, total: this.chain.height + 1 });
     });
 
-    app.get('/api/block/:heightOrHash', (req, res) => {
+    app.get('/api/block/:heightOrHash', syncLimiter, (req, res) => {
       const b = this.chain.getBlock(req.params.heightOrHash);
       if (!b) return res.status(404).json({ error: 'block not found' });
       res.json(b);
@@ -228,7 +265,7 @@ app.get('/api/state', (req, res) => {
       try { proof = require('../crypto-utils/zkp').decodeProof(row.proof); } catch (e) { proof = null; }
       res.json({ id: row.id, start: row.start_height, end: row.end_height, commitment: row.commitment, proof });
     });
-    app.get('/api/zkp/latest', (req, res) => {
+    app.get('/api/zkp/latest', syncLimiter, (req, res) => {
       if (!this.chain.zkp) return res.status(404).json({ error: 'zkp disabled' });
       const row = this.chain.zkp.getLatest();
       if (!row) return res.status(404).json({ error: 'no proofs yet' });
@@ -241,7 +278,7 @@ app.get('/api/state', (req, res) => {
       if (!this.chain.snapsync) return res.status(404).json({ error: 'snapsync disabled' });
       res.json({ snapshots: this.chain.snapsync.listMeta() });
     });
-    app.get('/api/snapshot/latest', (req, res) => {
+    app.get('/api/snapshot/latest', syncLimiter, (req, res) => {
       if (!this.chain.snapsync) return res.status(404).json({ error: 'snapsync disabled' });
       const snapObj = this.chain.snapsync.loadLatestSnapshot();
       if (!snapObj) return res.status(404).json({ error: 'no snapshots yet' });
@@ -442,7 +479,9 @@ app.get('/api/state', (req, res) => {
 
     app.get('/api/node/info', (req, res) => {
       const ns = this.registry.getStats();
-      res.json({ ...this.chain.getStats(), chain_id: this.cfg.chainId, chain_name: this.cfg.chainName, symbol: this.cfg.symbol, node_url: this.cfg.nodeUrl, node_id: this.NODE_ID, version: this.cfg.version, peers: this.peers.gossipPeers(20) });
+      res.json({ ...this.chain.getStats(), chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
+        consensus_version: CONSENSUS_VERSION, genesis_hash: this.chain.getBlock(0)?.hash || null,
+        symbol: this.cfg.symbol, node_url: this.cfg.nodeUrl, node_id: this.NODE_ID, version: this.cfg.version, peers: this.peers.gossipPeers(20) });
     });
     app.get('/api/node/status', (req, res) => res.json({
       height: this.chain.height, hash: this.chain.bestHash,
@@ -544,7 +583,7 @@ app.get('/api/state', (req, res) => {
         const txNonce = safeInt(req.body.nonce, user ? (user.nonce || 0) : 0);
         const gasLimit = safeInt(gas_limit, 3000000);
         const dataHex = /^0x/i.test(String(code)) ? String(code) : '0x' + String(code);
-        const txNoSig = { from_addr, to_addr: '', value: '', nonce: txNonce, gas_limit: gasLimit, data: dataHex };
+        const txNoSig = { from_addr, to_addr: '', value: '', nonce: txNonce, gas_limit: gasLimit, gas_price: String(gas_price || this.chain._baseFeeForHeight(this.chain.height + 1)), data: dataHex };
         const defaultFee = fee || String(minimumFee(txNoSig, this.chain._baseFeeForHeight(this.chain.height + 1)));
         const tx = { from_addr, to_addr: '', value: String(Math.round(Number(value) || 0) * 1e18 || 0), nonce: txNonce, fee: defaultFee, gas_limit: gasLimit, gas_price: String(gas_price || this.chain._baseFeeForHeight(this.chain.height + 1)), chain_id: this.cfg.chainId || '0', priority_fee: req.body.priority_fee || '0', data: dataHex };
         tx.signature = signature;
@@ -631,7 +670,7 @@ app.get('/api/state', (req, res) => {
         const nonce = user ? (user.nonce || 0) : 0;
         const gasPrice = req.body.gas_price || this.chain._baseFeeForHeight(this.chain.height + 1);
         const gasLimit = req.body.gas_limit || 3000000;
-        const txNoSig = { from_addr, to_addr: address, value: String(Math.round(Number(value) || 0) * 1e18 || 0), nonce, gas_limit: gasLimit, data: calldata };
+        const txNoSig = { from_addr, to_addr: address, value: String(Math.round(Number(value) || 0) * 1e18 || 0), nonce, gas_limit: gasLimit, gas_price: String(gasPrice), data: calldata };
         const defaultFee = minimumFee(txNoSig, this.chain._baseFeeForHeight(this.chain.height + 1));
         const tx = { from_addr, to_addr: address, value: String(Math.round(Number(value) || 0) * 1e18 || 0), nonce, fee: req.body.fee || String(defaultFee), gas_limit: gasLimit, gas_price: String(gasPrice), chain_id: this.cfg.chainId || '0', priority_fee: req.body.priority_fee || '0', data: calldata };
         tx.signature = signature;
@@ -672,7 +711,7 @@ const validation = await this.chain.validateTxForMempool(tx);
 
     app.get('/api/logs', requireAdmin, (req, res) => res.json({ logs: getLogBuffer() }));
 
-    app.post('/api/node/broadcast/block', p2pLimiter, async (req, res) => {
+    app.post('/api/node/broadcast/block', syncLimiter, async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
       let result = await this.chain.addBlock(block);
@@ -700,7 +739,7 @@ const validation = await this.chain.validateTxForMempool(tx);
       res.json({ ok: true, our_height: this.chain.height, node_id: this.NODE_ID, peers: this.peers.gossipPeers(10) });
     });
 
-    app.get('/peers', (req, res) => res.json({ peers: this.peers.gossipPeers(50), count: this.peers.count() }));
+    app.get('/peers', syncLimiter, (req, res) => res.json({ peers: this.peers.gossipPeers(50), count: this.peers.count() }));
     app.post('/register', p2pLimiter, (req, res) => {
       const url = require('../../config/config').normalizeUrl(req.body.url);
       if (!url || !req.body.node_id) return res.status(400).json({ error: 'url and node_id required' });

@@ -191,28 +191,10 @@ class P2PWebSocketServer {
   }
 
   broadcastBlock(block) {
-    this.broadcast('new_block', { 
-      block: {
-        height: block.height,
-        hash: block.hash,
-        parent_hash: block.parent_hash,
-        timestamp: block.timestamp,
-        miner: block.miner,
-        tx_count: block.tx_count,
-        tx_root: block.tx_root,
-        state_root: block.state_root,
-        chain_work: block.chain_work,
-        signature: block.signature,
-        generation_signature: block.generation_signature,
-        proof_digest: block.proof_digest,
-        plot_id: block.plot_id,
-        reward_cc: block.reward_cc,
-        target: block.target,
-        base_target: block.base_target,
-        base_fee: block.base_fee,
-        transactions: block.transactions
-      }
-    });
+    const payload = { ...block, chain_id: String(block.chain_id || '') };
+    delete payload.rewards_json;
+    delete payload.body_pruned;
+    this.broadcast('new_block', { block: payload });
   }
 
   broadcastTx(tx) {
@@ -339,15 +321,21 @@ class P2PWebSocketClient {
   }
 
   async _handleNewTx(tx) {
-    if (this.chain.db.prepare('SELECT 1 FROM mempool WHERE hash = ?').get(tx.hash)) return;
-    if (this.chain.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(tx.hash)) return;
-    
-    const validation = await this.chain.validateTxForMempool(tx);
-    if (validation.ok) {
-      const result = this.chain.addMempoolTx(tx);
-      if (result.ok && result.motivo !== 'Tx already in mempool') {
-        this.sync.broadcastTx(tx);
+    const release = this.chain.tryAcquireStableRead();
+    if (!release) return;
+    try {
+      if (this.chain.db.prepare('SELECT 1 FROM mempool WHERE hash = ?').get(tx.hash)) return;
+      if (this.chain.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(tx.hash)) return;
+
+      const validation = await this.chain.validateTxForMempool(tx);
+      if (validation.ok) {
+        const result = this.chain.addMempoolTx(tx);
+        if (result.ok && result.motivo !== 'Tx already in mempool') {
+          this.sync.broadcastTx(tx);
+        }
       }
+    } finally {
+      release();
     }
   }
 
@@ -362,18 +350,23 @@ class P2PWebSocketClient {
   }
 
 async _handleMempool(txs) {
-    for (const tx of txs) {
-      if (this.chain.db.prepare('SELECT 1 FROM mempool WHERE hash = ?').get(tx.hash)) continue;
-      if (this.chain.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(tx.hash)) continue;
-      
-      const validation = await this.chain.validateTxForMempool(tx);
-      if (validation.ok) {
-        this.chain.addMempoolTx(tx);
+    const release = this.chain.tryAcquireStableRead();
+    if (!release) return;
+    try {
+      for (const tx of txs) {
+        if (this.chain.db.prepare('SELECT 1 FROM mempool WHERE hash = ?').get(tx.hash)) continue;
+        if (this.chain.db.prepare('SELECT 1 FROM transactions WHERE hash = ?').get(tx.hash)) continue;
+
+        const validation = await this.chain.validateTxForMempool(tx);
+        if (validation.ok) this.chain.addMempoolTx(tx);
       }
+    } finally {
+      release();
     }
   }
 
   _handleHeartbeat(data) {
+    if (this.chain._stateTransitionPending) return;
     if (data.height > this.chain.height) {
       this._send({ type: 'get_blocks', from: this.chain.height, limit: 100 });
     }

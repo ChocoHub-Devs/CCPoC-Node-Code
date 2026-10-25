@@ -69,8 +69,7 @@ class ChocoNode {
         this.smartContracts.setDatabase(this.db);
         log('info', `Smart contracts (EVM) enabled`);
       } catch (e) {
-        log('warn', `Smart contracts enabled but VM unavailable: ${e.message}`);
-        this.smartContracts = null;
+      throw new Error(`consensus v6 requires the EVM runtime: ${e.message}`);
       }
     } else {
       log('info', `Smart contracts (EVM) disabled`);

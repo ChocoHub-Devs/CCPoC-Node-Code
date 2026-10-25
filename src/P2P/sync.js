@@ -2,6 +2,7 @@ const { URL } = require('url');
 const { safeInt, safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate } = require('../crypto-utils/crypto');
 const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
+const { CONSENSUS_VERSION } = require('../consensus/protocol');
 
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024; // 16 MiB
 
@@ -118,6 +119,14 @@ class SyncEngine {
         try {
           const remote = await fetchJSON(`${peer.url}/api/stats`, { timeout: 5 });
           if (!remote) { this.peers.fail(peer.url); continue; }
+          const localGenesis = this.chain.getBlock(0)?.hash;
+          if (String(remote.chain_id) !== String(this.cfg.chainId)
+            || Number(remote.consensus_version) !== CONSENSUS_VERSION
+            || String(remote.genesis_hash || '').toLowerCase() !== String(localGenesis || '').toLowerCase()) {
+            log('warn', `[P2P] refusing incompatible peer ${peer.url}: chain identity/version mismatch`);
+            this.peers.fail(peer.url);
+            continue;
+          }
           const remoteHeight = remote.height ?? remote.altura;
           if (typeof remoteHeight !== 'number') { this.peers.fail(peer.url); continue; }
           const remoteWork = safeBigInt(remote.chain_work, 0n);
@@ -161,6 +170,14 @@ class SyncEngine {
 
 
   async _syncFromPeer(peerUrl, remoteHeight) {
+    const identity = await fetchJSON(`${peerUrl}/api/stats`, { timeout: 5 });
+    const localGenesis = this.chain.getBlock(0)?.hash;
+    if (!identity || String(identity.chain_id) !== String(this.cfg.chainId)
+      || Number(identity.consensus_version) !== CONSENSUS_VERSION
+      || String(identity.genesis_hash || '').toLowerCase() !== String(localGenesis || '').toLowerCase()) {
+      log('warn', `[P2P] refusing sync from incompatible peer ${peerUrl}`);
+      return false;
+    }
     const commonHeight = await this._findCommonAncestor(peerUrl);
     let from = Math.max(0, commonHeight + 1);
     let inserted = 0;
@@ -177,6 +194,12 @@ class SyncEngine {
           if (this.db.prepare('SELECT 1 FROM blocks WHERE hash = ?').get(block.hash)) {
             if (block.height >= from) { from = block.height + 1; advanced = true; }
             continue;
+          }
+          const incumbent = this.chain.getBlock(block.height);
+          if (incumbent && incumbent.hash !== block.hash) {
+            log('debug', `sync: competing block at #${block.height}; defer branch validation until rollback`);
+            sawCompeting = true;
+            break;
           }
           block._from_local_forge = false;
           let insertResult = await this.chain.addBlock(block);
@@ -232,40 +255,28 @@ class SyncEngine {
     }
     const maxBlocks = this.cfg.maxBlocksPerSync || 10000;
     let from = commonHeight + 1;
-    let inserted = 0;
-    while (from <= remoteHeight && inserted < maxBlocks) {
+    const candidateBlocks = [];
+    while (from <= remoteHeight && candidateBlocks.length < maxBlocks) {
       const data = await fetchJSON(`${peerUrl}/api/blocks?from=${from}&limit=50`, { timeout: 15 });
-      if (!data || !Array.isArray(data.blocks) || !data.blocks.length) break;
-      let advanced = false;
+      if (!data || !Array.isArray(data.blocks) || !data.blocks.length) return false;
       for (const block of data.blocks) {
         if (block.height < from) continue;
-        if (this.db.prepare('SELECT 1 FROM blocks WHERE hash = ?').get(block.hash)) {
-          if (block.height >= from) { from = block.height + 1; advanced = true; }
-          continue;
+        if (block.height !== from) {
+          log('warn', `sync reorg: peer branch is discontinuous at height ${from}`);
+          return false;
         }
-        block._from_local_forge = false;
-        // The peer tip was compared against our local tip above. Intermediate
-        // blocks on that already-selected heavier branch can have equal work
-        // to the incumbent at the same height; do not apply the final fork
-        // choice independently to each prefix block.
-        let res = await this.chain.addBlock(block, {
-          forceSync: true,
-          allowIntermediateEqualWork: true,
-        });
-
-        if (!res.ok) { log('warn', `sync reorg: forceSync insert #${block.height} failed: ${res.motivo}`); return false; }
-        inserted++;
-        from = block.height + 1;
-        advanced = true;
+        candidateBlocks.push(block);
+        from++;
+        if (from > remoteHeight || candidateBlocks.length >= maxBlocks) break;
       }
-      if (!advanced) break;
     }
-    if (inserted === 0) return false;
-    this.chain._selectTip();
-    this.chain._purgeOrphanedBlocks();
-    const reorg = await this.chain.reorganize(peerTip, true);
+    if (from <= remoteHeight || !candidateBlocks.length || candidateBlocks[candidateBlocks.length - 1].hash !== peerTip.hash) {
+      log('warn', `sync reorg: candidate branch is incomplete (${candidateBlocks.length} blocks, target #${remoteHeight})`);
+      return false;
+    }
+    const reorg = await this.chain.reorganize(peerTip, true, false, candidateBlocks);
     if (reorg && reorg.ok) {
-      log('info', `Reorged to ${peerUrl} — now at #${reorg.height} ${(reorg.hash || '').slice(0, 10)} (${inserted} blocks applied)`);
+      log('info', `Reorged to ${peerUrl} — now at #${reorg.height} ${(reorg.hash || '').slice(0, 10)} (${candidateBlocks.length} blocks applied)`);
       return true;
     }
     log('debug', `sync: forced reorg finalize failed: ${reorg && reorg.motivo}`);
