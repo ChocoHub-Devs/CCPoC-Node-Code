@@ -38,7 +38,8 @@ function initDB(dbPath, cfg) {
       signature TEXT, block_height INTEGER, timestamp INTEGER,
       block_hash TEXT DEFAULT '', chain_id TEXT DEFAULT '', fee_cap TEXT DEFAULT '0',
       receipt_status INTEGER DEFAULT 1, gas_used INTEGER DEFAULT 0, cumulative_gas_used INTEGER DEFAULT 0,
-      tx_type INTEGER DEFAULT 0, max_fee_per_gas TEXT DEFAULT '', max_priority_fee_per_gas TEXT DEFAULT ''
+      tx_type INTEGER DEFAULT 0, max_fee_per_gas TEXT DEFAULT '', max_priority_fee_per_gas TEXT DEFAULT '',
+      wire_json TEXT DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_tx_from ON transactions(from_addr);
     CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_addr);
@@ -217,6 +218,7 @@ function initDB(dbPath, cfg) {
   try { db.prepare('ALTER TABLE transactions ADD COLUMN tx_type INTEGER DEFAULT 0').run(); } catch {}
   try { db.prepare("ALTER TABLE transactions ADD COLUMN max_fee_per_gas TEXT DEFAULT ''").run(); } catch {}
   try { db.prepare("ALTER TABLE transactions ADD COLUMN max_priority_fee_per_gas TEXT DEFAULT ''").run(); } catch {}
+  try { db.prepare("ALTER TABLE transactions ADD COLUMN wire_json TEXT DEFAULT ''").run(); } catch {}
 
   try {
     const rows = db.prepare('SELECT address, balance, nonce, public_key_secp256k1 FROM users WHERE address != lower(address)').all();

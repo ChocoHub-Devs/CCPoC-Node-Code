@@ -2,7 +2,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const { keccak256 } = require('ethers');
 const { createCustomCommon, Hardfork, Mainnet } = require('@ethereumjs/common');
-const { createTxFromRLP } = require('@ethereumjs/tx');
+const { decodeRawTransaction } = require('../consensus/ethereum-transaction');
 const { encode: encodeRlp } = require('@ethereumjs/rlp');
 const { hexToBytes, bytesToHex } = require('@ethereumjs/util');
 const { evmTxDigest, evmTxHash, signatureFromHex, recoverTransactionSender, isValidAddress, toChecksumAddress, sha256hex } = require('../crypto-utils/crypto');
@@ -79,15 +79,6 @@ function getBlockFromDatabase(db, heightOrHash) {
   }
   const hash = String(heightOrHash).replace(/^0x/i, '').toLowerCase();
   return db.prepare('SELECT * FROM blocks WHERE lower(hash) = ?').get(hash) || null;
-}
-
-function recoverableSignatureFromParsed(parsed) {
-  const vn = BigInt(parsed.v || 0n);
-  let recovery = 0;
-  if (vn === 27n || vn === 28n) recovery = Number(vn - 27n);
-  else if (vn >= 35n) recovery = Number((vn - 35n) % 2n);
-  const to32 = (b) => Buffer.from(b.toString(16).padStart(64, '0'), 'hex');
-  return Buffer.concat([Buffer.from([recovery]), to32(parsed.r), to32(parsed.s)]);
 }
 
 class EthereumRPC {
@@ -169,10 +160,12 @@ class EthereumRPC {
 
   _storageAt(address, position) {
     const addr = normalizeAddr(address);
-    const slot = normalizeHex(position).replace(/^0x/, '');
-    const row = this.db.prepare('SELECT value FROM smart_contract_storage WHERE lower(contract_address) = lower(?) AND slot = ?').get(addr, slot);
+    const quantity = parseQuantity(position, 'storage position');
+    if (quantity < 0n || quantity >= (1n << 256n)) throw rpcError(-32602, 'invalid storage position');
+    const slot = quantity.toString(16).padStart(64, '0');
+    const row = this.db.prepare('SELECT value FROM smart_contract_storage WHERE lower(contract_address) = lower(?) AND slot IN (?, ?)').get(addr, `0x${slot}`, slot);
     if (!row) return '0x0000000000000000000000000000000000000000000000000000000000000000';
-    return normalizeHex(String(row.value)).replace(/^0x/, '').padStart(64, '0');
+    return `0x${normalizeHex(String(row.value)).replace(/^0x/, '').padStart(64, '0')}`;
   }
 
   async _handleCall(txObj) {
@@ -186,13 +179,16 @@ class EthereumRPC {
     const c = this.db.prepare('SELECT code FROM smart_contracts WHERE lower(address) = lower(?)').get(to);
     if (!c || !c.code) return '0x';
     try {
-      const result = await this.smartContracts.runSmartContract(to, isValidAddress(from) ? from : ZERO_ADDRESS, data, Number(value));
+      const result = await this.smartContracts.runSmartContract(to, isValidAddress(from) ? from : ZERO_ADDRESS, data, String(value));
       return normalizeHex(result.returnValue || '0x');
     } catch (e) {
-      if (e && e.revertData) return e.revertData;
+      if (e && e.revertData != null) {
+        const err = rpcError(3, e.message || 'execution reverted');
+        err.data = e.revertData;
+        throw err;
+      }
       if (e && e.reason) {
-        const err = rpcError(-32000, e.reason);
-        err.data = '0x' + '08c379a0'.padEnd(8, '0');
+        const err = rpcError(3, e.reason);
         throw err;
       }
       throw rpcError(-32000, (e && e.message) || 'execution reverted');
@@ -203,7 +199,7 @@ class EthereumRPC {
     const to = normalizeAddr(txObj.to);
     const from = normalizeAddr(txObj.from || ZERO_ADDRESS);
     const data = normalizeHex(txObj.data || '0x');
-    const value = parseQuantity(txObj.value == null ? 0 : txObj.value, 'value');
+    const value = parseQuantity(txObj.value == null ? '0x0' : txObj.value, 'value');
     const hasData = data.length > 2 && data !== '0x';
     const intrinsic = BigInt(estimateIntrinsicGas({ data }));
     if (!this.smartContracts) return toQuantity(intrinsic);
@@ -242,10 +238,21 @@ class EthereumRPC {
     if (!tx) return null;
     const value = String(tx.value || 0);
     const gasLimit = String(tx.gas_limit || tx.gas || 21000);
-    const gasPrice = String(tx.gas_price || '1');
-    const v = tx.v != null ? normalizeHex(String(tx.v)) : '0x0';
-    const r = tx.r != null ? normalizeHex(String(tx.r)).replace(/^0x/, '').padStart(64, '0') : '0'.repeat(64);
-    const s = tx.s != null ? normalizeHex(String(tx.s)).replace(/^0x/, '').padStart(64, '0') : '0'.repeat(64);
+    let gasPrice = String(tx.gas_price || '1');
+    let signature = Buffer.alloc(0);
+    try {
+      if (tx.signature) signature = Buffer.from(String(tx.signature).replace(/^0x/, ''), String(tx.signature).startsWith('0x') ? 'hex' : 'base64');
+    } catch {}
+    const recovery = signature.length === 65 && signature[0] <= 1 ? signature[0] : null;
+    const type = Number(tx.tx_type ?? tx.type ?? 0);
+    if (type === 2) {
+      const cap = tx.maxFeePerGas ?? tx.max_fee_per_gas;
+      gasPrice = String(tx.block_height != null && tx.gas_used ? BigInt(tx.fee) / BigInt(tx.gas_used) : cap);
+    }
+    const derivedV = recovery == null ? 0n : (type === 0 ? BigInt(tx.chain_id || this._networkChainId) * 2n + 35n + BigInt(recovery) : BigInt(recovery));
+    const v = toQuantity(tx.v != null ? BigInt(tx.v) : derivedV);
+    const r = tx.r != null ? normalizeHex(String(tx.r)).replace(/^0x/, '').padStart(64, '0') : (recovery == null ? '0'.repeat(64) : signature.subarray(1, 33).toString('hex'));
+    const s = tx.s != null ? normalizeHex(String(tx.s)).replace(/^0x/, '').padStart(64, '0') : (recovery == null ? '0'.repeat(64) : signature.subarray(33).toString('hex'));
     const txIndex = indexProvided != null ? indexProvided : this._txIndex(tx);
     const rpc = {
       hash: normalizeHex(tx.hash || evmTxHash(tx)),
@@ -270,6 +277,10 @@ class EthereumRPC {
     if (maxFeePerGas != null && maxFeePerGas !== '' && maxPriorityFeePerGas != null && maxPriorityFeePerGas !== '') {
       rpc.maxFeePerGas = toQuantity(BigInt(maxFeePerGas));
       rpc.maxPriorityFeePerGas = toQuantity(BigInt(maxPriorityFeePerGas));
+    }
+    if (type === 2) {
+      rpc.accessList = [];
+      rpc.yParity = toQuantity(recovery ?? 0);
     }
     return rpc;
   }
@@ -405,60 +416,18 @@ class EthereumRPC {
       logs,
       logsBloom: logsToBloom(logs),
       status: tx.receipt_status ? '0x1' : '0x0',
-      type: '0x0',
+      type: toQuantityNumber(tx.tx_type ?? tx.type ?? 0),
     };
   }
 
   async _sendRawTransaction(rawHex) {
-    if (!rawHex) throw rpcError(-32602, 'missing raw transaction');
-    let rawBytes;
+    let tx;
     try {
-      const h = String(rawHex).replace(/^0x/i, '');
-      if (h.length % 2) throw new Error('odd hex');
-      rawBytes = Buffer.from(h, 'hex');
+      tx = decodeRawTransaction(rawHex);
     } catch (e) {
       throw rpcError(-32602, 'invalid raw transaction: ' + e.message);
     }
-    let parsed;
-    try {
-      parsed = createTxFromRLP(Uint8Array.from(rawBytes), { common: this.common });
-    } catch (e) {
-      throw rpcError(-32602, 'invalid raw transaction encoding: ' + e.message);
-    }
-    const sender = parsed.getSenderAddress().toString().toLowerCase();
-    const to = parsed.to ? normalizeAddr(parsed.to.toString()) : '';
-    const chainId = (parsed.common && parsed.common.chainId ? parsed.common.chainId() : 0n).toString();
-    if (chainId !== String(this._networkChainId)) throw rpcError(-32000, 'wrong chain id');
-    const gasPrice = String(parsed.gasPrice || 0n);
-    const recoverableSig = recoverableSignatureFromParsed(parsed);
-    const dataHex = hexData(parsed.data);
-    const gasLimit = Number(parsed.gasLimit || 0n);
-    const effectiveGasPrice = parsed.maxFeePerGas != null && parsed.maxFeePerGas > 0n ? parsed.maxFeePerGas : (parsed.gasPrice || 0n);
-    const fee = (BigInt(gasLimit) * effectiveGasPrice).toString();
-    const tx = {
-      from_addr: sender,
-      to_addr: to,
-      value: String(parsed.value || 0n),
-      nonce: Number(parsed.nonce || 0n),
-      gas_limit: gasLimit,
-      gas_price: gasPrice,
-      fee,
-      chain_id: chainId,
-      priority_fee: parsed.maxPriorityFeePerGas != null ? String((parsed.maxPriorityFeePerGas) || 0n) : '0',
-      data: dataHex,
-      signature: recoverableSig.toString('base64'),
-      rpc_signature: '0x' + rawBytes.toString('hex'),
-      raw: '0x' + rawBytes.toString('hex'),
-      rpc_type: 'evm',
-      type: parsed.type || 0,
-      v: parsed.v != null ? String(parsed.v) : undefined,
-      r: parsed.r != null ? '0x' + parsed.r.toString(16) : undefined,
-      s: parsed.s != null ? '0x' + parsed.s.toString(16) : undefined,
-      maxFeePerGas: parsed.maxFeePerGas != null ? String(parsed.maxFeePerGas) : undefined,
-      maxPriorityFeePerGas: parsed.maxPriorityFeePerGas != null ? String(parsed.maxPriorityFeePerGas) : undefined,
-    };
-    tx.hash = keccak256('0x' + rawBytes.toString('hex'));
-    tx.status = 1;
+    if (tx.chain_id !== String(this._networkChainId)) throw rpcError(-32000, 'wrong chain id');
     const validation = await this.chain.validateTxForMempool(tx);
     if (!validation.ok) throw rpcError(-32000, validation.motivo || 'transaction rejected');
     const result = this.chain.addMempoolTx(tx);
@@ -607,9 +576,7 @@ class EthereumRPC {
         return this._codeOf(normalizeAddr(p0));
       case 'eth_getStorageAt': {
         const addr = normalizeAddr(p0);
-        const pos = normalizeHex(p1 != null ? p1 : '0x0');
-        const val = this._storageAt(addr, pos);
-        return normalizeHex(val).replace(/^0x/, '').padStart(64, '0');
+        return this._storageAt(addr, p1 != null ? p1 : '0x0');
       }
       case 'eth_call':
         return await this._handleCall(p0 || {});
@@ -964,7 +931,9 @@ class EthereumRPC {
       return { jsonrpc: '2.0', id, result };
     } catch (e) {
       const code = e.rpcCode || -32603;
-      return { jsonrpc: '2.0', id, error: { code, message: e.message || 'internal error' } };
+      const error = { code, message: e.message || 'internal error' };
+      if (e.data !== undefined) error.data = e.data;
+      return { jsonrpc: '2.0', id, error };
     }
   }
 

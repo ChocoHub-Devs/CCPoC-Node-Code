@@ -1,3 +1,4 @@
+const { validateRawTransaction } = require('../consensus/ethereum-transaction');
 const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, evmTxHash, keccak256, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, SCOOPS_PER_NONCE, computeDeadline, pubkeyToAddress, recoverTransactionSender } = require('../crypto-utils/crypto');
 
 const { IncrementalStateRoot } = require('./state-trie');
@@ -13,6 +14,7 @@ const PocPlotV4 = require('../consensus/poc-plot-v4');
 const { CONSENSUS_VERSION } = require('../consensus/protocol');
 const { normalizeMaxSupply } = require('../consensus/config-values');
 const { ContractJournal } = require('./contract-journal');
+const { toWireTransaction } = require('./transaction-wire');
 
 function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; }
 
@@ -477,7 +479,7 @@ class Chain {
 
   _attachTransactions(bloco) {
     if (bloco && !Array.isArray(bloco.transactions)) {
-      bloco.transactions = this.db.prepare('SELECT * FROM transactions WHERE block_hash = ? ORDER BY rowid').all(bloco.hash);
+      bloco.transactions = this.db.prepare('SELECT * FROM transactions WHERE block_hash = ? ORDER BY rowid').all(bloco.hash).map((tx) => toWireTransaction(tx, { stored: true }));
     }
     if (bloco) {
       if (!Array.isArray(bloco.rewards)) {
@@ -855,7 +857,7 @@ class Chain {
         }
         for (const tx of txs) {
           const txHash = tx.hash || hashTransaction(tx);
-          this.db.prepare('INSERT OR REPLACE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data, chain_id, fee_cap, receipt_status, gas_used, cumulative_gas_used, tx_type, max_fee_per_gas, max_priority_fee_per_gas) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx._actualFee || 0n), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', height, tx.timestamp || now, bloco.hash, String(tx.data || ''), String(tx.chain_id || bloco.chain_id || this.cfg.chainId || '0'), String(tx.fee || 0), tx._receiptStatus, tx._gasUsed, tx._cumulativeGasUsed, safeInt(tx.type, 0), String(tx.maxFeePerGas || ''), String(tx.maxPriorityFeePerGas || ''));
+          this.db.prepare('INSERT OR REPLACE INTO transactions (hash, from_addr, to_addr, value, fee, nonce, gas_limit, gas_price, signature, block_height, timestamp, block_hash, data, chain_id, fee_cap, receipt_status, gas_used, cumulative_gas_used, tx_type, max_fee_per_gas, max_priority_fee_per_gas, wire_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(txHash, tx.from_addr, tx.to_addr || '', String(tx.value || 0), String(tx._actualFee || 0n), safeInt(tx.nonce, 0), safeInt(tx.gas_limit, 21000), String(tx.gas_price || '1'), tx.signature || '', height, tx.timestamp || now, bloco.hash, String(tx.data || ''), String(tx.chain_id || bloco.chain_id || this.cfg.chainId || '0'), String(tx.fee || 0), tx._receiptStatus, tx._gasUsed, tx._cumulativeGasUsed, safeInt(tx.type, 0), String(tx.maxFeePerGas || ''), String(tx.maxPriorityFeePerGas || ''), JSON.stringify(toWireTransaction(tx)));
           if (tx.from_addr) {
             const cur = this.db.prepare('SELECT balance, nonce FROM users WHERE address = ?').get(tx.from_addr);
             if (cur) {
@@ -1794,6 +1796,7 @@ class MemPool_Manager {
       const sender = tx.from_addr;
       if (!sender) return [false, 'invalid tx sender'];
       if (tx.chain_id == null || String(tx.chain_id) !== String(this.cfg.chainId || '')) return [false, 'wrong or missing chain_id'];
+      try { validateRawTransaction(tx); } catch (e) { return [false, e.message]; }
       if (tx.hash) {
         const expectedHash = tx.rpc_type === 'evm' && tx.raw
           ? keccak256(tx.raw)
@@ -1843,6 +1846,7 @@ class MemPool_Manager {
     if (tx.from_addr) tx.from_addr = normalizeAddr(tx.from_addr);
     if (tx.to_addr) tx.to_addr = normalizeAddr(tx.to_addr);
     if (tx.chain_id == null || String(tx.chain_id) !== String(this.cfg.chainId || '')) return { ok: false, motivo: 'wrong or missing chain_id' };
+    try { validateRawTransaction(tx); } catch (e) { return { ok: false, motivo: e.message }; }
     const sender = tx.from_addr;
     if (!sender) return { ok: false, motivo: 'missing from_addr' };
     if (!tx.to_addr && !tx.data) return { ok: false, motivo: 'missing to_addr (or data for contract creation)' };
@@ -1970,19 +1974,20 @@ class contracts_Manager {
     const payouts = [];
     const logs = [];
     const blkCtx = this._blockContext(bloco);
+    let nextLogIndex = 0;
     const appendLogs = (tx, res) => {
       if (!res || !Array.isArray(res.logs)) return;
-      let idx = 0;
       for (const raw of res.logs) {
         if (!raw) continue;
-        let address = raw.address;
+        let address = Array.isArray(raw) ? raw[0] : raw.address;
+        if (address instanceof Uint8Array) address = bytesToHex(address);
         if (address && typeof address === 'object' && address.bytes) address = bytesToHex(address.bytes);
         address = String(address || '').toLowerCase();
-        const topics = (raw.topics || []).map(t => (t && typeof t === 'object' && t instanceof Uint8Array) ? bytesToHex(t) : String(t || ''));
-        let data = raw.data;
+        const topics = ((Array.isArray(raw) ? raw[1] : raw.topics) || []).map(t => (t && typeof t === 'object' && t instanceof Uint8Array) ? bytesToHex(t) : String(t || ''));
+        let data = Array.isArray(raw) ? raw[2] : raw.data;
         if (data && data instanceof Uint8Array) data = bytesToHex(data);
         else if (data != null && !/^0x/.test(String(data))) data = '0x' + String(data);
-        logs.push({ tx_hash: (tx.hash || hashTransaction(tx)), address, topics: JSON.stringify(topics), data: String(data || '0x'), _idx: idx++ });
+        logs.push({ tx_hash: (tx.hash || hashTransaction(tx)), address, topics: JSON.stringify(topics), data: String(data || '0x'), _idx: nextLogIndex++ });
       }
     };
     try {

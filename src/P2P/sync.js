@@ -3,6 +3,7 @@ const { safeInt, safeBigInt, hashBlock, hashTransaction, isBetterChainCandidate 
 const { log } = require('../../config/config');
 const { FINALIZATION_DEPTH } = require('../Blockchain/chain');
 const { CONSENSUS_VERSION } = require('../consensus/protocol');
+const { toWireBlock } = require('../Blockchain/transaction-wire');
 
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024; 
 
@@ -546,6 +547,7 @@ class SyncEngine {
   }
 
   async broadcastBlock(block) {
+    block = toWireBlock(block);
     const key = `block:${block && block.hash ? block.hash : hashBlock(block)}`;
     if (!this._rememberBroadcast(key)) {
       log('debug', `[P2P] block broadcast deduplicated height=${block && block.height} hash=${String(block && block.hash || '').slice(0, 12)}`);

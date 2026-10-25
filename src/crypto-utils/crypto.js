@@ -3,6 +3,7 @@ const { keccak256 } = require('ethers');
 const { secp256k1 } = require('@noble/curves/secp256k1.js');
 const rlp = require('@ethereumjs/rlp');
 const { CONSENSUS_VERSION } = require('../consensus/protocol');
+const { validateRawTransaction } = require('../consensus/ethereum-transaction');
 const ZERO_HASH = '0'.repeat(64);
 
 const SECP_COMPRESSED_LEN = 33;
@@ -187,6 +188,8 @@ function evmTxHash(tx) {
 }
 
 function signTransactionTx(tx, privateKeyHex) {
+  if (tx.raw) throw new Error('signTransactionTx requires an unsigned native legacy transaction');
+  validateRawTransaction(tx);
   const pk = Buffer.from(stripHex(String(privateKeyHex)), 'hex');
   if (pk.length !== 32) throw new Error('Invalid private key length');
   const digest = Uint8Array.from(Buffer.from(evmTxDigest(tx), 'hex'));
@@ -198,6 +201,10 @@ function signTransactionTx(tx, privateKeyHex) {
 }
 
 function recoverTransactionSender(tx) {
+  try {
+    const signed = validateRawTransaction(tx);
+    if (signed) return signed.from_addr;
+  } catch { return null; }
   const sigIn = tx && (tx.signature || tx.rpc_signature);
   if (!sigIn) return null;
   let sig;

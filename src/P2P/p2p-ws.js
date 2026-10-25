@@ -1,6 +1,8 @@
 const WebSocket = require('ws');
 const { log } = require('../../config/config');
 
+const { toWireBlock } = require('../Blockchain/transaction-wire');
+
 class P2PWebSocketServer {
   constructor(port, chain, sync, peers) {
     this.port = port;
@@ -197,7 +199,7 @@ class P2PWebSocketServer {
   }
 
   broadcastBlock(block) {
-    const payload = { ...block, chain_id: String(block.chain_id || '') };
+    const payload = { ...toWireBlock(block), chain_id: String(block.chain_id || '') };
     delete payload.rewards_json;
     delete payload.body_pruned;
     this.broadcast('new_block', { block: payload });
