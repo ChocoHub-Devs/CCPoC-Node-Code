@@ -76,7 +76,7 @@ class PeerManager {
     if (isUnsafePeerUrl(normalized)) return;
     const existing = this.db.prepare('SELECT * FROM peers WHERE url = ?').get(normalized);
     const wasTimedOut = existing && existing.timeout_until > Date.now();
-    this.db.prepare("UPDATE peers SET last_seen = ?, height = ?, node_id = COALESCE(NULLIF(?, ''), node_id), health = MIN(1.0, health + 0.02), fail_count = 0, timeout_until = 0 WHERE url = ?").run(Date.now(), height || 0, nodeId || '', normalized);
+    this.db.prepare("UPDATE peers SET last_seen = ?, height = COALESCE(?, height), node_id = COALESCE(NULLIF(?, ''), node_id), health = MIN(1.0, health + 0.02), fail_count = 0, timeout_until = 0 WHERE url = ?").run(Date.now(), height == null ? null : height, nodeId || '', normalized);
     if (wasTimedOut) log('info', `Peer recovered: ${normalized}`);
   }
 

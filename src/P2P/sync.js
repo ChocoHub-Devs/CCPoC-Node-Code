@@ -19,6 +19,24 @@ function identityValue(value) {
   return serialized.length > 120 ? `${serialized.slice(0, 117)}...` : serialized;
 }
 
+class PeerHttpError extends Error {
+  constructor(status, retryAfterMs) {
+    super(`HTTP ${status}`);
+    this.name = 'PeerHttpError';
+    this.status = status;
+    this.retryable = [408, 425, 429, 500, 502, 503, 504].includes(status);
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function peerRetryDelay(header, body) {
+  const seconds = Number(header ?? body?.retry_after ?? body?.retryAfter);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(300000, Math.max(1000, seconds * 1000));
+  const date = header && Date.parse(header);
+  if (Number.isFinite(date) && date > Date.now()) return Math.min(300000, date - Date.now());
+  return 1000;
+}
+
 function fetchJSON(url, opts = {}) {
   const u = new URL(url);
   const mod = u.protocol === 'https:' ? require('https') : require('http');
@@ -33,6 +51,7 @@ function fetchJSON(url, opts = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const fail = (error) => { if (!settled) { settled = true; reject(error); } };
     const logTransfer = (result, status = '-', responseBytes = 0) => {
       log('debug', `[P2P] HTTP ${method} ${endpoint} status=${status} request_bytes=${requestBytes} response_bytes=${responseBytes} duration_ms=${Date.now() - startedAt} result=${result}`);
     };
@@ -58,9 +77,17 @@ function fetchJSON(url, opts = {}) {
         data += c;
       });
       res.on('end', () => {
+        if (settled) return;
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          let errorBody;
+          try { errorBody = JSON.parse(data); } catch {}
+          logTransfer('http_error', res.statusCode, size);
+          fail(new PeerHttpError(res.statusCode, peerRetryDelay(res.headers['retry-after'], errorBody)));
+          return;
+        }
         try {
           const parsed = JSON.parse(data);
-          logTransfer(res.statusCode >= 200 && res.statusCode < 300 ? 'ok' : 'http_error', res.statusCode, size);
+          logTransfer('ok', res.statusCode, size);
           done(parsed);
         } catch {
           logTransfer('invalid_json', res.statusCode, size);
@@ -114,6 +141,23 @@ class SyncEngine {
     this._broadcastSeen = new Map();
     this._lastSeedHeight = new Map();
     this._incompatiblePeerUntil = new Map();
+    this._peerRetryUntil = new Map();
+  }
+
+  _hasPeerIdentity(remote) {
+    return remote && !remote.error && /^(0|[1-9][0-9]*)$/.test(String(remote.chain_id ?? ''))
+      && Number.isInteger(remote.consensus_version) && remote.consensus_version > 0
+      && typeof remote.genesis_hash === 'string' && /^[a-fA-F0-9]{64}$/.test(remote.genesis_hash)
+      && Number.isSafeInteger(remote.height ?? remote.altura) && (remote.height ?? remote.altura) >= 0;
+  }
+
+  _handlePeerRequestError(peerUrl, error) {
+    if (error instanceof PeerHttpError && error.retryable) {
+      this._peerRetryUntil.set(peerUrl, Date.now() + error.retryAfterMs);
+      log('debug', `[P2P] peer temporarily unavailable peer=${peerLabel(peerUrl)} status=${error.status} retry_ms=${error.retryAfterMs}`);
+      return;
+    }
+    this.peers.fail(peerUrl);
   }
 
   _peerIdentityMismatches(remote) {
@@ -152,6 +196,7 @@ class SyncEngine {
   }
 
   _markIncompatiblePeer(peerUrl, remote) {
+    if (!this._hasPeerIdentity(remote)) return;
     const now = Date.now();
     if ((this._incompatiblePeerUntil.get(peerUrl) || 0) > now) return;
     this._incompatiblePeerUntil.set(peerUrl, now + 5 * 60_000);
@@ -184,22 +229,24 @@ class SyncEngine {
 
   async discoverPeers() {
     const selfHost = (() => { try { return this.cfg.nodeUrl ? new (require('url').URL)(this.cfg.nodeUrl).hostname : null; } catch { return null; } })();
-    const targets = [...new Set([...(this.cfg.seedPeers || []), ...this.peers.active(20).map(p => p.url)])];
+    const targets = [...new Set([...(this.cfg.seedPeers || []), ...this.peers.all(20).map(p => p.url)])];
     await Promise.allSettled(targets.map(async (url) => {
       try {
+        if ((this._peerRetryUntil.get(url) || 0) > Date.now()) return;
         const normalized = new (require('url').URL)(url);
         if (selfHost && normalized.hostname === selfHost) return;
         const data = await fetchJSON(`${url.replace(/\/+$/, '')}/peers`, { timeout: 8 });
         log('debug', `[P2P] Discovered peers from ${url}: ${data && Array.isArray(data.peers) ? data.peers.length + ' peers' : (() => { try { return JSON.stringify(data); } catch { return String(data); } })()}`);
-        if (data && Array.isArray(data.peers) && data.peers.length > 0) {
+        if (data && Array.isArray(data.peers)) {
+          this.peers.seen(url);
           for (const p of data.peers) {
             if (!p.url) continue;
             try { const pu = new (require('url').URL)(p.url); if (selfHost && pu.hostname === selfHost) continue; } catch { continue; }
             this.peers.add(p.url);
           }
         }
-      } catch {
-        this.peers.fail(url);
+      } catch (error) {
+        this._handlePeerRequestError(url, error);
       }
     }));
   }
@@ -207,7 +254,7 @@ class SyncEngine {
   async loopSync() {
     const now = Date.now();
     const cooldown = Math.max(2000, this.cfg.syncIntervalMs || 10000);
-    if (now - this._syncingAt < cooldown) return;
+    if (this.syncing || now - this._syncingAt < cooldown) return;
     this.syncing = true;
     this._syncingAt = now;
     try {
@@ -215,11 +262,17 @@ class SyncEngine {
         try { const u = new (require('url').URL)(p.url); if (this.cfg.nodeUrl && u.hostname === new (require('url').URL)(this.cfg.nodeUrl).hostname) return false; } catch {} return true;
       });
       for (const peer of peers) {
+        if ((this._peerRetryUntil.get(peer.url) || 0) > now) continue;
         if ((this._incompatiblePeerUntil.get(peer.url) || 0) > now) continue;
         this._incompatiblePeerUntil.delete(peer.url);
         try {
           const remote = await fetchJSON(`${peer.url}/api/stats`, { timeout: 5 });
           if (!remote) { this.peers.fail(peer.url); continue; }
+          if (!this._hasPeerIdentity(remote)) {
+            log('debug', `[P2P] ignoring invalid identity response peer=${peerLabel(peer.url)}`);
+            continue;
+          }
+          this.peers.seen(peer.url, remote.height ?? remote.altura, remote.node_id);
           const mismatches = this._peerIdentityMismatches(remote);
           if (mismatches.length) {
             this._markIncompatiblePeer(peer.url, remote);
@@ -239,7 +292,10 @@ class SyncEngine {
           log('debug', `loopSync: peer=${peer.url} remoteHeight=${remoteHeight} remoteWork=${remote.chain_work} localHeight=${this.chain.height} localWork=${localTip ? localTip.chain_work : 0}`);
           const synced = await this._syncFromPeer(peer.url, remoteHeight);
           if (synced) break;
-        } catch (e) { log('debug', `loopSync: peer=${peer.url} error=${e.message}`); }
+        } catch (e) {
+          if (e instanceof PeerHttpError) this._handlePeerRequestError(peer.url, e);
+          log('debug', `loopSync: peer=${peer.url} error=${e.message}`);
+        }
       }
     } finally { this.syncing = false; }
   }
@@ -269,7 +325,7 @@ class SyncEngine {
 
   async _syncFromPeer(peerUrl, remoteHeight) {
     const identity = await fetchJSON(`${peerUrl}/api/stats`, { timeout: 5 });
-    if (!identity) return false;
+    if (!this._hasPeerIdentity(identity)) return false;
     if (this._peerIdentityMismatches(identity).length) {
       this._markIncompatiblePeer(peerUrl, identity);
       return false;
@@ -313,7 +369,11 @@ class SyncEngine {
         }
         if (!advanced) break;
         log('info', `Sync progress: ${inserted} blocks inserted, at #${from - 1}/${remoteHeight}`);
-      } catch (e) { log('debug', `sync fetch error: ${e.message}`); break; }
+      } catch (e) {
+        if (e instanceof PeerHttpError) this._handlePeerRequestError(peerUrl, e);
+        log('debug', `sync fetch error: ${e.message}`);
+        break;
+      }
     }
     if (sawCompeting) {
       const fixed = await this._forceReorgToPeer(peerUrl, remoteHeight, commonHeight);
@@ -432,11 +492,12 @@ class SyncEngine {
   }
 
   async heartbeat() {
-    const peers = this.peers.active(20).filter(p => {
+    const peers = this.peers.all(20).filter(p => {
       try { const u = new (require('url').URL)(p.url); if (this.cfg.nodeUrl && u.hostname === new (require('url').URL)(this.cfg.nodeUrl).hostname) return false; } catch {} return true;
     });
     await Promise.allSettled(peers.map(async (peer) => {
       try {
+        if ((this._peerRetryUntil.get(peer.url) || 0) > Date.now()) return;
         const stats = this.chain.getStats();
         const res = await fetchJSON(`${peer.url}/api/node/announce`, {
           method: 'POST', body: {
@@ -444,7 +505,9 @@ class SyncEngine {
             node_id: this.NODE_ID, chain_work: stats.chain_work,
           }, timeout: 5,
         });
-        if (res) {
+        if (res && res.ok === true && Number.isSafeInteger(res.our_height) && res.our_height >= 0) {
+          this.peers.seen(peer.url, res.our_height, res.node_id);
+          this._peerRetryUntil.delete(peer.url);
           if (Array.isArray(res.peers)) {
             for (const p of res.peers) if (p.url) this.peers.add(p.url);
             const lastHeight = this._lastSeedHeight.get(peer.url);
@@ -456,7 +519,8 @@ class SyncEngine {
             }
           }
         }
-      } catch { this.peers.fail(peer.url); }
+        else if (!res) this.peers.fail(peer.url);
+      } catch (error) { this._handlePeerRequestError(peer.url, error); }
     }));
   }
 
@@ -465,16 +529,19 @@ class SyncEngine {
     const selfHost = (() => { try { return new (require('url').URL)(this.cfg.nodeUrl).hostname; } catch { return null; } })();
     await Promise.allSettled((this.cfg.seedPeers || []).map(async (seed) => {
       try {
+        if ((this._peerRetryUntil.get(seed) || 0) > Date.now()) return;
         if (selfHost && new (require('url').URL)(seed).hostname === selfHost) return;
         const stats = this.chain.getStats();
         log('debug', `[P2P] Announcing to seed peer ${seed}: height=${this.chain.height}, chain_work=${stats.chain_work}, node_id=${this.NODE_ID}`);
-        await fetchJSON(`${seed.replace(/\/+$/, '')}/register`, {
+        const res = await fetchJSON(`${seed.replace(/\/+$/, '')}/register`, {
           method: 'POST', body: {
             url: this.cfg.nodeUrl, node_id: this.NODE_ID, height: this.chain.height, altura: this.chain.height,
             chain_work: stats.chain_work, version: this.cfg.version, peers: this.peers.count(),
           }, timeout: 8,
         });
-      } catch { this.peers.fail(seed); }
+        if (res && res.ok === true) this.peers.seen(seed, res.our_height, res.node_id);
+        else if (!res) this.peers.fail(seed);
+      } catch (error) { this._handlePeerRequestError(seed, error); }
     }));
   }
 

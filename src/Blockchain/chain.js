@@ -11,6 +11,7 @@ const { bytesToHex } = require('@ethereumjs/util');
 const BN = require('bn.js');
 const PocPlotV4 = require('../consensus/poc-plot-v4');
 const { CONSENSUS_VERSION } = require('../consensus/protocol');
+const { normalizeMaxSupply } = require('../consensus/config-values');
 const { ContractJournal } = require('./contract-journal');
 
 function normalizeAddr(a) { return typeof a === 'string' ? a.toLowerCase() : a; }
@@ -26,6 +27,7 @@ class Config {
 
 class Chain {
   constructor(db, cfg) {
+    cfg.maxSupply = normalizeMaxSupply(cfg.maxSupply);
     this.db = db;
     this.cfg = cfg;
     if (cfg.smartContractsEnabled === false) {
@@ -124,7 +126,7 @@ class Chain {
       genesis_base_target: String(this.cfg.genesisBaseTarget),
       initial_reward: String(this.cfg.initialReward),
       halving_interval: safeInt(this.cfg.halvingInterval, 0),
-      max_supply: String(this.cfg.maxSupply),
+      max_supply: normalizeMaxSupply(this.cfg.maxSupply),
       difficulty_adjust_blocks: safeInt(this.cfg.difficultyAdjustBlocks, 0),
       expected_time_per_block: safeInt(this.cfg.expectedTimePerBlock, 0),
       base_target_window: safeInt(this.cfg.baseTargetWindow, 0),
@@ -442,7 +444,7 @@ class Chain {
     const rewardsData = bloco.rewards || [];
     if (!Array.isArray(rewardsData)) return { ok: false, motivo: 'invalid reward distribution' };
     const totalReward = calculateMiningReward(bloco.height, this.cfg);
-    const maxSupply = safeBigInt(this.cfg.maxSupply, 0n);
+    const maxSupply = BigInt(normalizeMaxSupply(this.cfg.maxSupply));
     if (maxSupply > 0n) {
       parentHash ||= this.db.prepare('SELECT parent_hash FROM blocks WHERE hash = ?').get(bloco.hash)?.parent_hash || this.bestHash;
       const ancestryRewards = this.db.prepare(`

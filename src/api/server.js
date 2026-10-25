@@ -698,7 +698,7 @@ const validation = await this.chain.validateTxForMempool(tx);
     app.post('/api/node/settings', requireAdmin, (req, res) => {
       const updates = req.body;
       if (!updates || typeof updates !== 'object') return res.status(400).json({ error: 'settings object required' });
-      const unsafe = ['adminToken', 'minerPrivateKey', 'minerPublicKey', 'dbPath', 'dataDir', 'plotsDir', 'port', 'p2pWsPort', 'discoveryPort', 'discoveryUrl', 'seedPeers', 'nodeUrl'];
+      const unsafe = ['adminToken', 'minerPrivateKey', 'minerPublicKey', 'dbPath', 'dataDir', 'plotsDir', 'port', 'p2pWsPort', 'discoveryPort', 'discoveryUrl', 'seedPeers', 'nodeUrl', 'maxSupply'];
       const sanitized = {};
       let changed = false;
       for (const [k, v] of Object.entries(updates)) {
