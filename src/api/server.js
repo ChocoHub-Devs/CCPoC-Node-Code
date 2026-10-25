@@ -190,6 +190,8 @@ class Server {
       res.json({
         ...stats, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
         consensus_version: CONSENSUS_VERSION, genesis_hash: this.chain.getBlock(0)?.hash || null,
+        consensus_params: this.chain._consensusParameters(),
+        genesis_plot_registrations: this.chain.genesisPlotRegistrations,
         symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.height + 1, this.cfg).toString(),
         current_reward_cc: Number(calculateMiningReward(this.chain.height + 1, this.cfg)) / 1e18,
         blocks_to_halving: this.cfg.halvingInterval - (this.chain.height % this.cfg.halvingInterval),

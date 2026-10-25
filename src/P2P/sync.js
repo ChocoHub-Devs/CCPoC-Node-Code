@@ -6,6 +6,19 @@ const { CONSENSUS_VERSION } = require('../consensus/protocol');
 
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024; 
 
+function stableIdentityJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableIdentityJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableIdentityJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function identityValue(value) {
+  const serialized = stableIdentityJson(value);
+  return serialized.length > 120 ? `${serialized.slice(0, 117)}...` : serialized;
+}
+
 function fetchJSON(url, opts = {}) {
   const u = new URL(url);
   const mod = u.protocol === 'https:' ? require('https') : require('http');
@@ -100,6 +113,50 @@ class SyncEngine {
     this._lastReorg = 0;
     this._broadcastSeen = new Map();
     this._lastSeedHeight = new Map();
+    this._incompatiblePeerUntil = new Map();
+  }
+
+  _peerIdentityMismatches(remote) {
+    const mismatches = [];
+    const localChainId = String(this.cfg.chainId);
+    const remoteChainId = String(remote && remote.chain_id);
+    if (remoteChainId !== localChainId) mismatches.push(`chain_id local=${localChainId} remote=${remoteChainId}`);
+    const remoteConsensus = Number(remote && remote.consensus_version);
+    if (remoteConsensus !== CONSENSUS_VERSION) mismatches.push(`consensus_version local=${CONSENSUS_VERSION} remote=${remoteConsensus}`);
+    const localGenesis = String(this.chain.getBlock(0)?.hash || '').toLowerCase();
+    const remoteGenesis = String(remote && remote.genesis_hash || '').toLowerCase();
+    if (remoteGenesis !== localGenesis) mismatches.push(`genesis_hash local=${localGenesis || 'missing'} remote=${remoteGenesis || 'missing'}`);
+    if (remote && remote.consensus_params && typeof remote.consensus_params === 'object') {
+      const localParams = this.chain._consensusParameters();
+      const keys = new Set([...Object.keys(localParams), ...Object.keys(remote.consensus_params)]);
+      for (const key of [...keys].sort()) {
+        const localValue = localParams[key];
+        const remoteValue = remote.consensus_params[key];
+        if (stableIdentityJson(localValue) !== stableIdentityJson(remoteValue)) {
+          mismatches.push(`consensus_params.${key} local=${identityValue(localValue)} remote=${identityValue(remoteValue)}`);
+        }
+      }
+    } else if (remoteGenesis !== localGenesis) {
+      mismatches.push('peer does not expose consensus_params in /api/stats');
+    }
+    if (remote && Array.isArray(remote.genesis_plot_registrations)) {
+      const localPlots = [...(this.chain.genesisPlotRegistrations || [])].sort((a, b) => String(a.plot_id).localeCompare(String(b.plot_id)));
+      const remotePlots = [...remote.genesis_plot_registrations].sort((a, b) => String(a.plot_id).localeCompare(String(b.plot_id)));
+      if (stableIdentityJson(localPlots) !== stableIdentityJson(remotePlots)) {
+        mismatches.push(`genesis_plot_registrations local=${identityValue(localPlots)} remote=${identityValue(remotePlots)}`);
+      }
+    } else if (remoteGenesis !== localGenesis) {
+      mismatches.push('peer does not expose genesis_plot_registrations in /api/stats');
+    }
+    return mismatches;
+  }
+
+  _markIncompatiblePeer(peerUrl, remote) {
+    const now = Date.now();
+    if ((this._incompatiblePeerUntil.get(peerUrl) || 0) > now) return;
+    this._incompatiblePeerUntil.set(peerUrl, now + 5 * 60_000);
+    const mismatches = this._peerIdentityMismatches(remote);
+    log('warn', `[P2P] refusing incompatible peer ${peerUrl}: ${mismatches.join('; ')}; peer is reachable and will not be penalized`);
   }
 
   _isSeedPeer(peerUrl) {
@@ -158,15 +215,14 @@ class SyncEngine {
         try { const u = new (require('url').URL)(p.url); if (this.cfg.nodeUrl && u.hostname === new (require('url').URL)(this.cfg.nodeUrl).hostname) return false; } catch {} return true;
       });
       for (const peer of peers) {
+        if ((this._incompatiblePeerUntil.get(peer.url) || 0) > now) continue;
+        this._incompatiblePeerUntil.delete(peer.url);
         try {
           const remote = await fetchJSON(`${peer.url}/api/stats`, { timeout: 5 });
           if (!remote) { this.peers.fail(peer.url); continue; }
-          const localGenesis = this.chain.getBlock(0)?.hash;
-          if (String(remote.chain_id) !== String(this.cfg.chainId)
-            || Number(remote.consensus_version) !== CONSENSUS_VERSION
-            || String(remote.genesis_hash || '').toLowerCase() !== String(localGenesis || '').toLowerCase()) {
-            log('warn', `[P2P] refusing incompatible peer ${peer.url}: chain identity/version mismatch`);
-            this.peers.fail(peer.url);
+          const mismatches = this._peerIdentityMismatches(remote);
+          if (mismatches.length) {
+            this._markIncompatiblePeer(peer.url, remote);
             continue;
           }
           const remoteHeight = remote.height ?? remote.altura;
@@ -213,11 +269,9 @@ class SyncEngine {
 
   async _syncFromPeer(peerUrl, remoteHeight) {
     const identity = await fetchJSON(`${peerUrl}/api/stats`, { timeout: 5 });
-    const localGenesis = this.chain.getBlock(0)?.hash;
-    if (!identity || String(identity.chain_id) !== String(this.cfg.chainId)
-      || Number(identity.consensus_version) !== CONSENSUS_VERSION
-      || String(identity.genesis_hash || '').toLowerCase() !== String(localGenesis || '').toLowerCase()) {
-      log('warn', `[P2P] refusing sync from incompatible peer ${peerUrl}`);
+    if (!identity) return false;
+    if (this._peerIdentityMismatches(identity).length) {
+      this._markIncompatiblePeer(peerUrl, identity);
       return false;
     }
     const commonHeight = await this._findCommonAncestor(peerUrl);
